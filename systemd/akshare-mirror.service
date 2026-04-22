@@ -1,0 +1,15 @@
+[Unit]
+Description=AKShare -> GitHub mirror (daily snapshot for slate)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+EnvironmentFile=__REPO_ROOT__/.env
+ExecStart=__REPO_ROOT__/.venv/bin/python __REPO_ROOT__/scripts/fetch_and_push.py
+# 2h cap covers the worst-case financials full pass.
+TimeoutStartSec=7200
+Nice=10
+StandardOutput=journal
+StandardError=journal
