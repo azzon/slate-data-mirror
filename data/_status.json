@@ -1,8 +1,8 @@
 {
   "endpoints": {
     "securities": {
-      "last_success": "2026-04-22T10:30:02.769321+00:00",
-      "last_elapsed_s": 3.0,
+      "last_success": "2026-04-22T21:25:11.601278+00:00",
+      "last_elapsed_s": 2.8,
       "last_meta": {
         "rows": 5648,
         "size_kb": 93,
@@ -105,5 +105,5 @@
     "skipped": 0,
     "elapsed_s": 85.5
   },
-  "updated_at": "2026-04-22T10:31:25.328781+00:00"
+  "updated_at": "2026-04-22T21:25:11.601580+00:00"
 }
