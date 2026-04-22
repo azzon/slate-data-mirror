@@ -29,28 +29,32 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 90
     steps:
-      - name: Diag (pre-checkout)
-        run: |
-          echo "== runner env =="
-          uname -a; whoami; pwd; echo "HOME=$HOME"
-          echo "== active connections to github =="
-          ss -tnp 2>/dev/null | grep -i github || echo "(no github tcp sessions)"
-          echo "== disk =="
-          df -h ${GITHUB_WORKSPACE:-.} | tail -2
-          echo "== prior _work contents =="
-          ls -la "${RUNNER_WORKSPACE:-.}/.." 2>/dev/null | head -20 || true
-          echo "== git version =="
-          git --version
-          echo "== known_hosts =="
-          cat ~/.ssh/known_hosts 2>/dev/null | head -5
-          echo "== try ssh to github.com (via the runner user's ~/.ssh/config forcing :443) =="
-          timeout 20 ssh -o BatchMode=yes -T git@github.com 2>&1 | head -5 || echo "ssh probe timed out"
-
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+      - name: Checkout via SSH-over-443
+        # actions/checkout@v4 hard-codes HTTPS, which is RST'd from this ISP
+        # (GnuTLS recv error -110). Do a manual clone over SSH instead —
+        # the runner user's ~/.ssh/config routes github.com to
+        # ssh.github.com:443 which is reliable from mainland.
         timeout-minutes: 5
+        run: |
+          set -e
+          WORK="${{ github.workspace }}"
+          mkdir -p "$WORK"
+          cd "$WORK"
+          if [ -d .git ]; then
+            echo "reusing existing clone"
+            git remote set-url origin git@github.com:azzon/slate-data-mirror.git
+            git fetch --depth=1 origin "${{ github.sha }}" || git fetch --depth=1 origin main
+            git checkout --detach FETCH_HEAD
+            git clean -ffdx
+          else
+            echo "fresh clone"
+            git clone --depth 1 git@github.com:azzon/slate-data-mirror.git .
+            # If we were dispatched on a non-main SHA, fetch and check it out
+            if [ "${{ github.sha }}" != "$(git rev-parse HEAD)" ]; then
+              git fetch --depth=1 origin "${{ github.sha }}" && git checkout --detach FETCH_HEAD || true
+            fi
+          fi
+          echo "at $(git rev-parse --short HEAD) -- $(git log -1 --oneline)"
 
       - name: Ensure Python deps
         run: |
