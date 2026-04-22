@@ -67,7 +67,15 @@ jobs:
           .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" -r requirements.txt
           .venv/bin/python -c "import akshare; print('akshare', akshare.__version__)"
 
-      - name: Fetch
+      - name: Configure git identity + SSH remote
+        # fetch_all.py now does per-endpoint incremental pushes; set identity
+        # once here.
+        run: |
+          git config user.email "mirror-bot@slate"
+          git config user.name "slate-mirror-bot"
+          git remote set-url origin git@github.com:azzon/slate-data-mirror.git
+
+      - name: Fetch (per-endpoint commits)
         env:
           ONLY: ${{ github.event.inputs.only }}
           FORCE: ${{ github.event.inputs.force }}
@@ -77,18 +85,17 @@ jobs:
           if [ "$FORCE" = "true" ]; then args="$args --force"; fi
           .venv/bin/python scripts/fetch_all.py $args
 
-      - name: Commit + push
+      - name: Final sweep push
+        # Safety net: if the last endpoint failed after writing partial
+        # output that wasn't pushed, sweep it up here. Normally a no-op.
+        if: always()
         run: |
-          git config user.email "mirror-bot@slate"
-          git config user.name "slate-mirror-bot"
           git add data/
           if git diff --cached --quiet; then
-            echo "No data changes — nothing to commit."
+            echo "nothing to sweep — per-endpoint pushes caught everything."
             exit 0
           fi
-          ts=$(date -u +"%Y-%m-%d %H:%M UTC")
-          git commit -m "data: snapshot $ts"
-          # Runner uses SSH remote (HTTPS to github.com is flaky from this ISP).
+          git commit -m "data: final sweep $(date -u +%Y-%m-%dT%H:%MZ)"
           git push origin HEAD:main
 
       - name: Status summary

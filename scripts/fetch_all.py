@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -370,7 +371,31 @@ def _is_due(ep: Endpoint, status: dict, *, force: bool) -> bool:
     return age_h >= ep.cadence_h
 
 
-def run_once(*, only: list[str] | None, force: bool) -> int:
+def _git_push_incremental(ep_name: str, meta: dict) -> None:
+    """Commit this endpoint's new data + status, push to origin.
+
+    Per-endpoint commits mean: (a) progress is visible live in the Actions
+    UI and on the repo, (b) a late-endpoint failure never loses earlier
+    work. Failure here logs + continues — a push hiccup shouldn't abort
+    the pass; the *next* endpoint's push will catch it up.
+    """
+    def run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(args, cwd=REPO_ROOT, check=check, text=True, capture_output=True)
+    try:
+        run("git", "add", "data/")
+        if run("git", "diff", "--cached", "--quiet", check=False).returncode == 0:
+            log.info("  (no diff to commit for %s)", ep_name)
+            return
+        rows = meta.get("rows", meta.get("boards", meta.get("members", "?")))
+        run("git", "commit", "-m", f"data({ep_name}): {rows} rows")
+        run("git", "push", "origin", "HEAD:main")
+        log.info("  pushed %s", ep_name)
+    except subprocess.CalledProcessError as e:  # noqa: BLE001
+        log.warning("  push failed for %s: %s — will retry on next endpoint", ep_name,
+                    (e.stderr or e.stdout or "").strip()[-200:])
+
+
+def run_once(*, only: list[str] | None, force: bool, incremental_push: bool) -> int:
     status = _load_status()
     started = time.time()
     succeeded = failed = skipped = 0
@@ -396,6 +421,11 @@ def run_once(*, only: list[str] | None, force: bool) -> int:
             }
             succeeded += 1
             log.info("  ✓ %s (%.1fs)", ep.name, elapsed)
+            # Persist status every endpoint so a later crash doesn't lose
+            # the "last_success" entries we just earned.
+            _save_status(status)
+            if incremental_push:
+                _git_push_incremental(ep.name, meta)
         except Exception as e:  # noqa: BLE001
             failed += 1
             prior = status["endpoints"].get(ep.name, {})
@@ -407,6 +437,7 @@ def run_once(*, only: list[str] | None, force: bool) -> int:
             }
             log.error("  ✗ %s: %s", ep.name, e)
             log.debug(traceback.format_exc())
+            _save_status(status)
 
     status["last_pass"] = {
         "at": datetime.now(timezone.utc).isoformat(),
@@ -428,6 +459,10 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--only", help="comma-separated endpoint names to run (skip cadence check implied)")
     p.add_argument("--force", action="store_true", help="ignore cadence, run everything")
+    p.add_argument("--no-push", action="store_true",
+                   help="skip per-endpoint git push (let caller push once at the end)")
     args = p.parse_args()
     only = [s.strip() for s in args.only.split(",")] if args.only else None
-    sys.exit(run_once(only=only, force=bool(args.only) or args.force))
+    sys.exit(run_once(only=only,
+                      force=bool(args.only) or args.force,
+                      incremental_push=not args.no_push))
