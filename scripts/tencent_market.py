@@ -274,32 +274,45 @@ def fetch_daily_bars(
 
     Dates are ``YYYYMMDD`` on input (akshare compat) but Tencent wants
     ``YYYY-MM-DD``. Transparent to callers.
+
+    **Pagination.** Tencent's fqkline caps responses at 640 trade days
+    per call (even if ``lmt`` param is higher). For windows wider than
+    ~600 calendar days we auto-split into sequential sub-windows and
+    merge — so a 5y request ends up making 4 calls per ticker.
     """
     end_d = end or dt.date.today().strftime("%Y%m%d")
-    start_fmt = f"{start[:4]}-{start[4:6]}-{start[6:8]}"
-    end_fmt = f"{end_d[:4]}-{end_d[4:6]}-{end_d[6:8]}"
+    start_dt = dt.date(int(start[:4]), int(start[4:6]), int(start[6:8]))
+    end_dt = dt.date(int(end_d[:4]), int(end_d[4:6]), int(end_d[6:8]))
     tickers = list(tickers)
 
-    def _fetch_one(ticker: str) -> tuple[str, list[dict]]:
+    # Build list of (sub_start, sub_end) windows covering the requested
+    # range. 600 days each — safely under the 640-bar server cap.
+    WINDOW_DAYS = 600
+    windows: list[tuple[dt.date, dt.date]] = []
+    cursor = start_dt
+    while cursor <= end_dt:
+        sub_end = min(cursor + dt.timedelta(days=WINDOW_DAYS - 1), end_dt)
+        windows.append((cursor, sub_end))
+        cursor = sub_end + dt.timedelta(days=1)
+
+    def _fetch_window(ticker: str, sub_start: dt.date, sub_end: dt.date) -> list[dict]:
         qt = _qt_code(ticker)
         params = {
-            "param": f"{qt},day,{start_fmt},{end_fmt},640,qfq",
+            "param": f"{qt},day,{sub_start.isoformat()},{sub_end.isoformat()},640,qfq",
         }
         try:
             c = _pool_client()
             r = c.get(_KLINE, params=params)
             payload = r.json()
         except Exception as e:
-            logger.debug(f"tencent bars failed {ticker}: {e}")
-            return ticker, []
+            logger.debug(f"tencent bars failed {ticker} [{sub_start}→{sub_end}]: {e}")
+            return []
         if payload.get("code") != 0:
-            return ticker, []
+            return []
         block = payload.get("data", {}).get(qt) or {}
         raw = block.get("qfqday") or block.get("day") or []
         out: list[dict] = []
         for row in raw:
-            # Tencent may append extra trailing fields (indicators). We
-            # only need the first six and ignore the rest defensively.
             if len(row) < 6:
                 continue
             try:
@@ -310,15 +323,26 @@ def fetch_daily_bars(
                         "close": float(row[2]),
                         "high": float(row[3]),
                         "low": float(row[4]),
-                        # gtimg volume unit is "手"; akshare returns 股.
-                        # Multiply by 100 so downstream market_daily is
-                        # consistent with prior akshare-ingested rows.
+                        # gtimg volume unit is "手"; multiply by 100 for
+                        # consistency with akshare's 股-granularity volume.
                         "volume": float(row[5]) * 100.0,
                     }
                 )
             except (TypeError, ValueError):
                 continue
-        return ticker, out
+        return out
+
+    def _fetch_one(ticker: str) -> tuple[str, list[dict]]:
+        all_bars: list[dict] = []
+        seen_dates: set[str] = set()
+        for sub_start, sub_end in windows:
+            bars = _fetch_window(ticker, sub_start, sub_end)
+            for b in bars:
+                if b["trade_date"] not in seen_dates:
+                    all_bars.append(b)
+                    seen_dates.add(b["trade_date"])
+        all_bars.sort(key=lambda r: r["trade_date"])
+        return ticker, all_bars
 
     result: dict[str, list[dict]] = {}
     # Periodic heartbeat so a stall is visible in journalctl instead
