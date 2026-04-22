@@ -96,15 +96,29 @@ def _pool_client(timeout: float = 8.0) -> httpx.Client:
     existing = getattr(_TLS, "client", None)
     if existing is not None:
         return existing
+    # Explicit connect/read/write/pool all bounded — a previous aliyun
+    # runner stall showed 100% of threads futex_wait with no active
+    # sockets; looked like a deadlock in the default pool cleanup when
+    # we create+close many pools per bootstrap. Giving every phase a
+    # hard timeout prevents "silent forever" stalls.
+    tmo = httpx.Timeout(
+        connect=timeout,
+        read=timeout,
+        write=timeout,
+        pool=timeout,
+    )
     client = httpx.Client(
         proxy=_proxy(),
-        timeout=timeout,
+        timeout=tmo,
         headers={"User-Agent": "Mozilla/5.0 slate-tencent/0.6"},
         limits=httpx.Limits(
             max_keepalive_connections=8,
             max_connections=16,
             keepalive_expiry=30.0,
         ),
+        # Don't let a retry-happy connection sit idle forever after a
+        # network hiccup — closes avoid the tail-latency trap.
+        trust_env=False,
     )
     _TLS.client = client
     return client

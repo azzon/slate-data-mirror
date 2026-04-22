@@ -147,15 +147,35 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
         log.info("  flushed %d rows across %d dates", written, len(list(rows_by_date)))
 
     # Process in CHUNK-sized ticker batches. Each batch hits Tencent
-    # via tm.fetch_daily_bars (max_workers=8 internally), flushes to
+    # via tm.fetch_daily_bars (max_workers=N internally), flushes to
     # parquet, checkpoints progress, and pushes.
+    #
+    # Hard wall-clock timeout per chunk — if tm.fetch_daily_bars hangs
+    # (seen once: all workers stuck in futex_wait with no active
+    # sockets), we kill that chunk's subprocess and move on so the
+    # bootstrap doesn't freeze for hours.
     completed = 0
+    CHUNK_TIMEOUT_S = 300  # 50 tickers × 4 windows × 2s-ish ~= 400s; bound at 5 min
+    from concurrent.futures import ThreadPoolExecutor as _Executor, TimeoutError as _FTimeout
+
     for chunk_start in range(0, len(todo), CHUNK):
         chunk = todo[chunk_start:chunk_start + CHUNK]
         try:
-            bars_by_ticker = tm.fetch_daily_bars(
-                chunk, start=start, end=end, max_workers=workers
-            )
+            with _Executor(max_workers=1) as ex:
+                fut = ex.submit(tm.fetch_daily_bars, chunk,
+                                start=start, end=end, max_workers=workers)
+                try:
+                    bars_by_ticker = fut.result(timeout=CHUNK_TIMEOUT_S)
+                except _FTimeout:
+                    log.error("  chunk %d-%d timed out (>%ds) — marking tickers failed",
+                              chunk_start, chunk_start + len(chunk), CHUNK_TIMEOUT_S)
+                    for t in chunk:
+                        new_failed[t] = "chunk_timeout"
+                    # Cancel the hung future; ex.__exit__ will wait for
+                    # it to drain. If it doesn't drain, we lose a worker
+                    # thread but the outer loop keeps going.
+                    fut.cancel()
+                    continue
         except Exception as e:  # noqa: BLE001
             log.error("  chunk %d-%d failed: %s — skipping",
                       chunk_start, chunk_start + len(chunk), e)
