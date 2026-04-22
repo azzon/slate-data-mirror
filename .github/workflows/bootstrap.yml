@@ -1,0 +1,63 @@
+name: Bootstrap history
+
+# Manual-only — runs once to populate ~5 years of per-ticker OHLCV.
+# Safe to re-run: the script resumes from _bootstrap_progress.json.
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: "Years of history to backfill"
+        required: false
+        default: "5"
+      reset:
+        description: "Discard prior progress and start over (true/false)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: bootstrap
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: self-hosted
+    timeout-minutes: 360
+    steps:
+      - name: Checkout via SSH-over-443
+        timeout-minutes: 5
+        run: |
+          set -e
+          WORK="${{ github.workspace }}"
+          mkdir -p "$WORK"
+          cd "$WORK"
+          if [ -d .git ]; then
+            git remote set-url origin git@github.com:azzon/slate-data-mirror.git
+            git fetch --depth=1 origin main
+            git checkout --detach FETCH_HEAD
+            git clean -ffdx
+          else
+            git clone --depth 1 git@github.com:azzon/slate-data-mirror.git .
+          fi
+          echo "at $(git rev-parse --short HEAD)"
+
+      - name: Ensure Python deps
+        run: |
+          python3 -m venv .venv
+          PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+          .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" --upgrade pip
+          .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" -r requirements.txt
+
+      - name: Configure git identity + SSH remote
+        run: |
+          git config user.email "mirror-bot@slate"
+          git config user.name "slate-mirror-bot"
+          git remote set-url origin git@github.com:azzon/slate-data-mirror.git
+
+      - name: Backfill
+        env:
+          YEARS: ${{ github.event.inputs.years }}
+          RESET: ${{ github.event.inputs.reset }}
+        run: |
+          args="--years $YEARS"
+          if [ "$RESET" = "true" ]; then args="$args --reset"; fi
+          .venv/bin/python scripts/bootstrap_history.py $args
