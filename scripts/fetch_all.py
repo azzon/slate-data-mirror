@@ -442,17 +442,27 @@ def fetch_industries() -> dict:
 
 
 def fetch_research() -> dict:
-    for sym in ("全部", "今日"):
-        try:
-            df = _ak_call(ak.stock_research_report_em, symbol=sym)
-            if df is not None and not df.empty:
-                today = _today_cn().isoformat()
-                _write_parquet(df, "research/latest.parquet")
-                kb = _write_parquet(df, f"research/history/{today}.parquet")
-                return {"rows": len(df), "size_kb": kb, "symbol": sym}
-        except Exception as e:  # noqa: BLE001
-            log.warning("  research symbol=%s failed: %s", sym, e)
-    return {"rows": 0, "note": "all symbol variants failed — likely upstream schema change"}
+    """Per-ticker research reports. AKShare's API changed — `symbol="全部"`
+    no longer works; must query per ticker. Serial with AKSHARE_SLEEP;
+    5500 × 1.5s ≈ 2.3h — only runs in the weekly slow workflow."""
+    sec = _ak_call(ak.stock_info_a_code_name)
+    codes = sec["code"].astype(str).tolist()
+
+    def one(code: str):
+        df = _ak_call(ak.stock_research_report_em, symbol=code)
+        if df is not None and not df.empty:
+            df = df.copy()
+            df["code"] = code
+            return df
+        return None
+
+    df = _per_ticker_serial(codes, one, label="research")
+    if df.empty:
+        return {"rows": 0, "note": "no research reports for any ticker"}
+    today = _today_cn().isoformat()
+    _write_parquet(df, "research/latest.parquet")
+    kb = _write_parquet(df, f"research/history/{today}.parquet")
+    return {"rows": len(df), "size_kb": kb}
 
 
 def fetch_news() -> dict:
@@ -510,11 +520,12 @@ ENDPOINTS: list[Endpoint] = [
     Endpoint("yjyg",          cadence_h=20, fetcher=fetch_yjyg),
     Endpoint("margin",        cadence_h=20, fetcher=fetch_margin),
     Endpoint("research",      cadence_h=20, fetcher=fetch_research),
-    # Weekly (quarterly-paced data):
+    # Weekly (quarterly-paced data + per-ticker loops):
     Endpoint("financials",    cadence_h=24 * 7, fetcher=fetch_financials, tags=["slow"]),
     Endpoint("shareholders",  cadence_h=24 * 7, fetcher=fetch_shareholders),
     Endpoint("concepts",      cadence_h=24 * 7, fetcher=fetch_concepts,   tags=["slow"]),
     Endpoint("industries",    cadence_h=24 * 7, fetcher=fetch_industries, tags=["slow"]),
+    Endpoint("research",      cadence_h=24 * 7, fetcher=fetch_research,   tags=["slow"]),
 ]
 
 

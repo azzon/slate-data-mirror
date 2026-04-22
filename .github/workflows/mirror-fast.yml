@@ -68,7 +68,7 @@ jobs:
           MIRROR_AKSHARE_SLEEP: "1.5"
         run: |
           if [ -z "$ONLY" ]; then
-            ONLY="securities,macro,north_flow,lhb,yjyg,margin,research,news"
+            ONLY="securities,macro,north_flow,lhb,yjyg,margin,news"
           fi
           args="--only $ONLY"
           if [ "$FORCE" = "true" ]; then args="$args --force"; fi

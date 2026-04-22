@@ -62,7 +62,7 @@ jobs:
           MIRROR_AKSHARE_SLEEP: "2.0"
         run: |
           if [ -z "$ONLY" ]; then
-            ONLY="shareholders,concepts,industries,financials"
+            ONLY="shareholders,concepts,industries,research,financials"
           fi
           .venv/bin/python scripts/fetch_all.py --only $ONLY
 
