@@ -1,11 +1,12 @@
 {
   "endpoints": {
     "securities": {
-      "last_success": "2026-04-22T06:29:20.562391+00:00",
-      "last_elapsed_s": 7.1,
+      "last_success": "2026-04-22T10:30:02.769321+00:00",
+      "last_elapsed_s": 3.0,
       "last_meta": {
-        "rows": 5508,
-        "size_kb": 90
+        "rows": 5648,
+        "size_kb": 93,
+        "source": "tencent"
       },
       "last_error": null,
       "fail_streak": 0
@@ -31,5 +32,5 @@
     "skipped": 0,
     "elapsed_s": 84.6
   },
-  "updated_at": "2026-04-22T10:27:54.925975+00:00"
+  "updated_at": "2026-04-22T10:30:02.769733+00:00"
 }
