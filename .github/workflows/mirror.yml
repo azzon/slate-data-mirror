@@ -37,9 +37,12 @@ jobs:
       - name: Ensure Python deps
         run: |
           python3 -m venv .venv
-          .venv/bin/pip install --quiet --upgrade pip
+          # CN mirror — pypi.org from mainland is slow/flaky enough that
+          # akshare+pandas+pyarrow (~100 MB) regularly stalls past 10 min.
+          PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+          .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" --upgrade pip
           # Pin nothing — AKShare ships anti-scrape fixes in patch releases.
-          .venv/bin/pip install --quiet -r requirements.txt
+          .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" -r requirements.txt
           .venv/bin/python -c "import akshare; print('akshare', akshare.__version__)"
 
       - name: Fetch
