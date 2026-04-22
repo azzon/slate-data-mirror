@@ -276,13 +276,22 @@ def fetch_industries() -> dict:
 
 
 def fetch_research() -> dict:
-    df = ak.stock_research_report_em(symbol="全部")
-    if df is None or df.empty:
-        return {"rows": 0, "note": "empty research report dump"}
-    today = _today_cn().isoformat()
-    _write_parquet(df, "research/latest.parquet")
-    kb = _write_parquet(df, f"research/history/{today}.parquet")
-    return {"rows": len(df), "size_kb": kb}
+    """Analyst research reports. The upstream API occasionally drops the
+    'infoCode' field, triggering a KeyError inside akshare's own parser.
+    Try a few known-good symbol forms; report empty rather than crash."""
+    # Known AKShare-accepted values: "全部" (old), stock code (per-ticker).
+    # If "全部" breaks, we at least get "今日" (today's fresh reports).
+    for sym in ("全部", "今日"):
+        try:
+            df = ak.stock_research_report_em(symbol=sym)
+            if df is not None and not df.empty:
+                today = _today_cn().isoformat()
+                _write_parquet(df, "research/latest.parquet")
+                kb = _write_parquet(df, f"research/history/{today}.parquet")
+                return {"rows": len(df), "size_kb": kb, "symbol": sym}
+        except Exception as e:  # noqa: BLE001
+            log.warning("  research symbol=%s failed: %s", sym, e)
+    return {"rows": 0, "note": "all symbol variants failed — likely upstream schema change"}
 
 
 def fetch_news() -> dict:
