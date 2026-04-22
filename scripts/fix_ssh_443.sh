@@ -19,6 +19,14 @@ if systemctl list-unit-files ssh.socket >/dev/null 2>&1; then
 fi
 systemctl enable ssh.service >/dev/null 2>&1
 
+echo "==> ensure PrivSep dir (ssh.socket used to auto-create this)"
+mkdir -p /run/sshd
+chmod 755 /run/sshd
+# Make it survive reboots without ssh.socket
+cat > /etc/tmpfiles.d/sshd-privsep.conf <<'EOF'
+d /run/sshd 0755 root root -
+EOF
+
 echo "==> write drop-in pinning Port 22 + Port 443"
 mkdir -p /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/99-dualport.conf <<'EOF'
