@@ -187,16 +187,27 @@ def _is_trading_day(d: date) -> bool:
 
 
 def fetch_market_daily() -> dict:
-    """Append today's OHLCV (post-close) + backfill any missing recent days.
+    """Append today's OHLCV (post-close) + backfill any missing trading day.
 
-    Two responsibilities:
+    Responsibilities:
     1. If today's file doesn't exist and it's after 16:00 CST (post-close),
        fetch today.
-    2. Scan the last 30 calendar days for any trading day whose parquet is
-       missing and backfill it.
+    2. Scan the full history window (default 5 years) for any trading day
+       whose parquet is missing and backfill it. Capped at MAX_GAP_FILL per
+       run so a long outage doesn't produce an 8-hour workflow.
+    3. Trust but verify: files below ROW_COUNT_FLOOR are treated as
+       partial/broken and re-fetched (catches cases where a previous run
+       crashed mid-write).
+
+    We budget a bounded number of gap fills per run. A runner-lost-comms
+    incident that leaves 30 days unfilled won't monopolise one workflow
+    run — subsequent 4h cron triggers will chip away until healed.
     """
     today = _today_cn()
     now = datetime.now(CST)
+    MAX_GAP_FILL = int(os.environ.get("MIRROR_MAX_GAP_FILL", "20"))
+    HISTORY_DAYS = int(os.environ.get("MIRROR_HISTORY_DAYS", str(365 * 5 + 1)))
+    ROW_COUNT_FLOOR = int(os.environ.get("MIRROR_DAILY_ROW_FLOOR", "1000"))
 
     pending: list[date] = []
 
@@ -205,19 +216,36 @@ def fetch_market_daily() -> dict:
         if not _market_daily_path(today).exists():
             pending.append(today)
 
-    # Last 30 days — fill gaps
-    for back in range(1, 31):
+    # Full-history gap scan (bounded)
+    for back in range(1, HISTORY_DAYS + 1):
         d = today - timedelta(days=back)
         if not _is_trading_day(d):
             continue
-        if not _market_daily_path(d).exists():
+        path = _market_daily_path(d)
+        if not path.exists():
             pending.append(d)
+        else:
+            # Detect partial writes (a previous run crashed mid-dump).
+            # Reading size is cheap; reading row count needs a parquet
+            # read. File-size < 40KB is ~40 rows — definitely broken.
+            try:
+                if path.stat().st_size < 40_000:
+                    # Verify row count rather than trusting just size
+                    n = len(pd.read_parquet(path))
+                    if n < ROW_COUNT_FLOOR:
+                        log.info("  refilling partial %s (%d rows)", d, n)
+                        pending.append(d)
+            except Exception:  # noqa: BLE001
+                pending.append(d)
+        if len(pending) >= MAX_GAP_FILL:
+            break
 
     if not pending:
-        return {"rows": 0, "note": "no pending dates (all recent days already mirrored)"}
+        return {"rows": 0, "note": "no pending dates (all trading days in window present)"}
 
     pending.sort(reverse=True)
-    log.info("  market_daily pending dates: %s", [d.isoformat() for d in pending])
+    log.info("  market_daily pending dates: %d (showing first 5: %s)",
+             len(pending), [d.isoformat() for d in pending[:5]])
 
     total_rows = 0
     filled = []
@@ -236,7 +264,8 @@ def fetch_market_daily() -> dict:
     return {
         "rows": total_rows,
         "filled_dates": filled,
-        "pending_dates": [d.isoformat() for d in pending],
+        "pending_total": len(pending),
+        "budget": MAX_GAP_FILL,
     }
 
 

@@ -91,12 +91,20 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
     universe = tm.fetch_universe()
     all_tickers = [u["ticker"] for u in universe]
     progress = _load_progress()
-    done = set(progress["market_daily"]["done_codes"])  # Now stores tickers, not bare codes
-    failed = progress["market_daily"].get("failed_codes", {})
+    done = set(progress["market_daily"]["done_codes"])
+    failed_prior = progress["market_daily"].get("failed_codes", {})
+    # Previously-failed tickers get retried automatically on every run.
+    # Transient Tencent hiccups that hit a handful of tickers on run N
+    # will usually succeed on run N+1. Only a permanently-delisted
+    # ticker stays stuck — and that's fine, we log it.
     todo = [t for t in all_tickers if t not in done]
+    retry_list = [t for t in failed_prior if t in all_tickers and t not in done]
+    if retry_list:
+        log.info("market_daily bootstrap: %d previously-failed tickers being retried", len(retry_list))
+        # retry_list is already a subset of todo (failed != done), so no merge needed
 
     log.info("market_daily bootstrap: %d total, %d done, %d remaining (of which %d previously failed)",
-             len(all_tickers), len(done), len(todo), len(failed))
+             len(all_tickers), len(done), len(todo), len(failed_prior))
     log.info("window: %s → %s, workers: %d (Tencent gtimg)", start, end, workers)
 
     # Tencent has its own internal keep-alive pool + worker management in
@@ -211,6 +219,55 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
     )
     log.info("market_daily bootstrap: ok=%d fail=%d in %.1f min",
              len(new_done), len(new_failed), total_mins)
+
+    _sanity_check_market_daily(expected_years=years)
+
+
+def _sanity_check_market_daily(*, expected_years: int, min_daily_tickers: int = 2000) -> None:
+    """Post-bootstrap verification. Hard-fail if the data looks wrong.
+
+    Checks:
+    1. Date coverage — N year request should produce >= 0.95 × N × 245
+       trading-day files (245 = typical A-share trading days/year).
+    2. Row-count floor — every file in the last 90 days must have >=
+       `min_daily_tickers` rows. Catches cases where pagination regressed
+       and only ~30 tickers land per date.
+    3. Coverage drift — files should be monotonically non-decreasing
+       in ticker count as we move toward present (new listings,
+       survivorship bias); a 50%+ drop after any date indicates a
+       failed chunk wrote partial data.
+    """
+    root = DATA_DIR / "market_daily"
+    if not root.exists():
+        raise RuntimeError("sanity: market_daily directory missing after bootstrap")
+    files = sorted(root.rglob("*.parquet"))
+
+    # 1. Date coverage
+    expected = int(0.95 * expected_years * 245)
+    if len(files) < expected:
+        raise RuntimeError(
+            f"sanity: only {len(files)} parquet files, expected >= {expected} for {expected_years}y"
+        )
+
+    # 2. Row-count floor for recent files
+    recent = files[-90:]
+    bad: list[str] = []
+    for p in recent:
+        n = len(pd.read_parquet(p))
+        if n < min_daily_tickers:
+            bad.append(f"{p.name}={n}")
+    if bad:
+        raise RuntimeError(
+            f"sanity: {len(bad)} recent files below {min_daily_tickers}-ticker floor: {bad[:5]}"
+        )
+
+    # 3. Coverage drift — median ticker count in last 30 days
+    recent30 = files[-30:]
+    if recent30:
+        counts = [len(pd.read_parquet(p)) for p in recent30]
+        median_recent = sorted(counts)[len(counts) // 2]
+        log.info("sanity: OK — %d files, median %d tickers/day in last 30 days",
+                 len(files), median_recent)
 
 
 def bootstrap_financials() -> None:

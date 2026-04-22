@@ -1,22 +1,30 @@
-name: Mirror slow endpoints (weekly)
+name: Mirror slow endpoints (weekly + daily retry)
 
 # Per-ticker bulk endpoints that burn a lot of AKShare calls:
-# financials, concepts, industries, shareholders.
+# financials, concepts, industries, research, shareholders.
 #
 # Strictly serial fetch with MIRROR_AKSHARE_SLEEP=2s between calls.
 # ~5500 tickers × 2s = ~3h for financials. Concepts/industries are
 # a few hundred boards each (much faster).
 #
-# Weekly Sunday 03:00 CST. Timeout 6h. Never runs during market hours.
+# Primary schedule: Sun 03:00 CST. Plus a daily 02:30 CST pre-check —
+# if the last successful pass is older than 6 days, run it now. That
+# way a failed weekly run self-heals on Mon/Tue instead of waiting a
+# full week.
 on:
   schedule:
-    - cron: "0 19 * * 6"   # Sat 19:00 UTC = Sun 03:00 CST
+    - cron: "0 19 * * 6"   # Sat 19:00 UTC = Sun 03:00 CST (primary)
+    - cron: "30 18 * * 0,1,2,3,4,5"  # Mon-Sat 18:30 UTC = 02:30 CST (retry)
   workflow_dispatch:
     inputs:
       only:
         description: "Comma-separated endpoint names (empty = all slow)"
         required: false
         default: ""
+      force:
+        description: "Ignore age check, run now"
+        required: false
+        default: "false"
 
 concurrency:
   group: mirror
@@ -56,7 +64,47 @@ jobs:
           git config user.name "slate-mirror-bot"
           git remote set-url origin git@github.com:azzon/slate-data-mirror.git
 
+      - name: Decide whether to run
+        id: decide
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+          EVENT: ${{ github.event_name }}
+          CRON: ${{ github.event.schedule }}
+        run: |
+          # Always run on manual dispatch or on the primary (Sun) cron.
+          # For the Mon-Sat retry cron, only run if the last successful
+          # financials pass is >6 days ago (i.e. a primary run was missed
+          # or failed).
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "$FORCE" = "true" ]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"; echo "reason=manual"; exit 0
+          fi
+          if [ "$CRON" = "0 19 * * 6" ]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"; echo "reason=primary"; exit 0
+          fi
+          # Retry cron — check freshness
+          if [ ! -f data/_status.json ]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"; echo "reason=no status file"; exit 0
+          fi
+          last_ok=$(python3 -c "
+          import json, sys
+          from datetime import datetime, timezone, timedelta
+          s = json.load(open('data/_status.json'))
+          ep = s.get('endpoints', {}).get('financials', {})
+          t = ep.get('last_success')
+          if not t:
+              print('none'); sys.exit(0)
+          age_d = (datetime.now(timezone.utc) - datetime.fromisoformat(t)).total_seconds() / 86400
+          print(f'{age_d:.1f}')
+          ")
+          echo "financials age days: $last_ok"
+          if [ "$last_ok" = "none" ] || [ "$(echo "$last_ok > 6" | bc -l 2>/dev/null || echo 1)" = "1" ]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"; echo "reason=stale ($last_ok days)"
+          else
+            echo "run=no" >> "$GITHUB_OUTPUT"; echo "reason=fresh ($last_ok days)"
+          fi
+
       - name: Fetch slow endpoints
+        if: steps.decide.outputs.run == 'yes'
         env:
           ONLY: ${{ github.event.inputs.only }}
           MIRROR_AKSHARE_SLEEP: "2.0"
@@ -76,3 +124,7 @@ jobs:
           fi
           git commit -m "data: slow sweep $(date -u +%Y-%m-%dT%H:%MZ)"
           git push origin HEAD:main
+
+      - name: Prune old history snapshots
+        if: steps.decide.outputs.run == 'yes'
+        run: .venv/bin/python scripts/prune_history.py
