@@ -1,0 +1,78 @@
+name: Mirror slow endpoints (weekly)
+
+# Per-ticker bulk endpoints that burn a lot of AKShare calls:
+# financials, concepts, industries, shareholders.
+#
+# Strictly serial fetch with MIRROR_AKSHARE_SLEEP=2s between calls.
+# ~5500 tickers × 2s = ~3h for financials. Concepts/industries are
+# a few hundred boards each (much faster).
+#
+# Weekly Sunday 03:00 CST. Timeout 6h. Never runs during market hours.
+on:
+  schedule:
+    - cron: "0 19 * * 6"   # Sat 19:00 UTC = Sun 03:00 CST
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "Comma-separated endpoint names (empty = all slow)"
+        required: false
+        default: ""
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  fetch-slow:
+    runs-on: self-hosted
+    timeout-minutes: 360
+    steps:
+      - name: Checkout via SSH-over-443
+        timeout-minutes: 5
+        run: |
+          set -e
+          WORK="${{ github.workspace }}"
+          mkdir -p "$WORK"
+          cd "$WORK"
+          if [ -d .git ]; then
+            git remote set-url origin git@github.com:azzon/slate-data-mirror.git
+            git fetch --depth=1 origin main
+            git checkout --detach FETCH_HEAD
+            git clean -ffdx
+          else
+            git clone --depth 1 git@github.com:azzon/slate-data-mirror.git .
+          fi
+
+      - name: Ensure Python deps
+        run: |
+          python3 -m venv .venv
+          PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+          .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" --upgrade pip
+          .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" -r requirements.txt
+
+      - name: Configure git identity + SSH remote
+        run: |
+          git config user.email "mirror-bot@slate"
+          git config user.name "slate-mirror-bot"
+          git remote set-url origin git@github.com:azzon/slate-data-mirror.git
+
+      - name: Fetch slow endpoints
+        env:
+          ONLY: ${{ github.event.inputs.only }}
+          MIRROR_AKSHARE_SLEEP: "2.0"
+        run: |
+          if [ -z "$ONLY" ]; then
+            ONLY="shareholders,concepts,industries,financials"
+          fi
+          .venv/bin/python scripts/fetch_all.py --only $ONLY
+
+      - name: Final sweep push
+        if: always()
+        run: |
+          git add data/
+          if git diff --cached --quiet; then
+            echo "nothing to sweep"
+            exit 0
+          fi
+          git commit -m "data: slow sweep $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push origin HEAD:main

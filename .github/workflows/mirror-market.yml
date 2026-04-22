@@ -1,0 +1,75 @@
+name: Mirror market_daily
+
+# Tencent-sourced daily OHLCV. fetch_market_daily gates itself on
+# post-close time (>=16:00 CST) and auto-backfills any missing dates
+# in the last 30 days.
+#
+# CN cron: 16:30 daily (30min after market close so prints are final).
+# Also a 17:30 safety run for the minority of tickers that publish late.
+on:
+  schedule:
+    - cron: "30 8 * * *"    # 16:30 CST
+    - cron: "30 9 * * *"    # 17:30 CST (catch stragglers)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Ignore cadence"
+        required: false
+        default: "false"
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  fetch-market:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - name: Checkout via SSH-over-443
+        timeout-minutes: 5
+        run: |
+          set -e
+          WORK="${{ github.workspace }}"
+          mkdir -p "$WORK"
+          cd "$WORK"
+          if [ -d .git ]; then
+            git remote set-url origin git@github.com:azzon/slate-data-mirror.git
+            git fetch --depth=1 origin main
+            git checkout --detach FETCH_HEAD
+            git clean -ffdx
+          else
+            git clone --depth 1 git@github.com:azzon/slate-data-mirror.git .
+          fi
+
+      - name: Ensure Python deps
+        run: |
+          python3 -m venv .venv
+          PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+          .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" --upgrade pip
+          .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" -r requirements.txt
+
+      - name: Configure git identity + SSH remote
+        run: |
+          git config user.email "mirror-bot@slate"
+          git config user.name "slate-mirror-bot"
+          git remote set-url origin git@github.com:azzon/slate-data-mirror.git
+
+      - name: Fetch market_daily
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          args="--only market_daily"
+          if [ "$FORCE" = "true" ]; then args="$args --force"; fi
+          .venv/bin/python scripts/fetch_all.py $args
+
+      - name: Final sweep push
+        if: always()
+        run: |
+          git add data/
+          if git diff --cached --quiet; then
+            echo "nothing to sweep"
+            exit 0
+          fi
+          git commit -m "data: market_daily sweep $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push origin HEAD:main

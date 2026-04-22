@@ -31,7 +31,6 @@ import subprocess
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from http.client import RemoteDisconnected
@@ -96,6 +95,18 @@ def _retry(fn: Callable, *args, tries: int = 3, base_delay: float = 5.0, **kw):
     raise last  # unreachable
 
 
+# Per-call throttle for AKShare endpoints. Ultra-conservative: we'd
+# rather take 3 hours on a 5500-ticker sweep than take 30s and burn
+# another 24h in an Eastmoney ban. Caller can override per endpoint.
+AKSHARE_SLEEP = float(os.environ.get("MIRROR_AKSHARE_SLEEP", "1.5"))
+
+
+def _ak_call(fn: Callable, *args, **kw):
+    """Retry-wrapped AKShare call with built-in throttle."""
+    time.sleep(AKSHARE_SLEEP)
+    return _retry(fn, *args, tries=3, base_delay=10.0, **kw)
+
+
 def _write_parquet(df: pd.DataFrame, rel: str) -> int:
     path = DATA_DIR / rel
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,7 +141,7 @@ def fetch_securities() -> dict:
             return {"rows": len(df), "size_kb": kb, "source": "tencent"}
     except Exception as e:  # noqa: BLE001
         log.warning("  tencent universe failed (%s) — falling back to akshare", e)
-    df = _retry(ak.stock_info_a_code_name)
+    df = _ak_call(ak.stock_info_a_code_name)
     kb = _write_parquet(df, "securities/latest.parquet")
     return {"rows": len(df), "size_kb": kb, "source": "akshare"}
 
@@ -229,16 +240,25 @@ def fetch_market_daily() -> dict:
     }
 
 
-def _per_ticker(codes: list[str], fetch_one: Callable[[str], pd.DataFrame | None], *, workers: int, label: str) -> pd.DataFrame:
+def _per_ticker_serial(codes: list[str], fetch_one: Callable[[str], pd.DataFrame | None], *, label: str) -> pd.DataFrame:
+    """Single-threaded per-ticker loop with AKSHARE_SLEEP throttle.
+
+    We used ThreadPoolExecutor at 4-6 workers originally. After seeing a
+    full-universe Eastmoney IP ban during a bulk run we reverted to
+    strict serial: fewer requests per unit time *is* the point. 5500
+    tickers × 1.5s ≈ 2.3h. Ample, and ban-proof.
+    """
     rows: list[pd.DataFrame] = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(fetch_one, c): c for c in codes}
-        for i, fut in enumerate(as_completed(futures), 1):
-            out = fut.result()
+    failed = 0
+    for i, code in enumerate(codes, 1):
+        try:
+            out = fetch_one(code)
             if out is not None and not out.empty:
                 rows.append(out)
-            if i % 500 == 0:
-                log.info("  %s %d/%d", label, i, len(codes))
+        except Exception:  # noqa: BLE001
+            failed += 1
+        if i % 200 == 0:
+            log.info("  %s %d/%d (%d failed)", label, i, len(codes), failed)
     if not rows:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
@@ -247,41 +267,29 @@ def _per_ticker(codes: list[str], fetch_one: Callable[[str], pd.DataFrame | None
 def fetch_financials() -> dict:
     """Per-ticker full-history financial abstract.
 
-    Runs once/week (cadence_h=168). Uses 4 workers — financials_abstract
-    is the single most fragile AKShare endpoint on our infra: it already
-    tripped Eastmoney rate-limits at 6 workers. Keep slow and steady.
+    Runs weekly. Strictly serial with AKSHARE_SLEEP between calls —
+    5500 tickers × 1.5s ≈ 2.3 hours. The speed hit is worth it: any
+    ban on this endpoint blocks financials for a week, and the data
+    changes quarterly, so we never need speed.
     """
-    sec = _retry(ak.stock_info_a_code_name)
+    sec = _ak_call(ak.stock_info_a_code_name)
     codes = sec["code"].astype(str).tolist()
 
-    ok_count = 0
-    fail_count = 0
-
     def one(code: str):
-        nonlocal ok_count, fail_count
-        try:
-            df = _retry(ak.stock_financial_abstract, symbol=code, tries=2)
-            if df is not None and not df.empty:
-                df = df.copy()
-                df["code"] = code
-                ok_count += 1
-                return df
-        except Exception:  # noqa: BLE001
-            fail_count += 1
-            return None
-        fail_count += 1
+        df = _ak_call(ak.stock_financial_abstract, symbol=code)
+        if df is not None and not df.empty:
+            df = df.copy()
+            df["code"] = code
+            return df
         return None
 
-    df = _per_ticker(codes, one, workers=4, label="financials")
+    df = _per_ticker_serial(codes, one, label="financials")
     if df.empty:
-        raise RuntimeError(f"financials returned 0 rows ({fail_count} failures)")
+        raise RuntimeError("financials returned 0 rows")
     today = _today_cn().isoformat()
     _write_parquet(df, "financials/latest.parquet")
     kb = _write_parquet(df, f"financials/history/{today}.parquet")
-    return {
-        "rows": len(df), "size_kb": kb,
-        "tickers_ok": ok_count, "tickers_fail": fail_count,
-    }
+    return {"rows": len(df), "size_kb": kb}
 
 
 def fetch_macro() -> dict:
@@ -294,7 +302,7 @@ def fetch_macro() -> dict:
     total = 0
     for name, fn in calls.items():
         try:
-            df = _retry(fn)
+            df = _ak_call(fn)
             if df is None or df.empty:
                 log.warning("  macro.%s empty", name)
                 continue
@@ -308,7 +316,7 @@ def fetch_macro() -> dict:
 
 
 def fetch_north_flow() -> dict:
-    df = _retry(ak.stock_hsgt_hold_stock_em, market="北向", indicator="今日排行")
+    df = _ak_call(ak.stock_hsgt_hold_stock_em, market="北向", indicator="今日排行")
     today = _today_cn().isoformat()
     df["as_of"] = today
     _write_parquet(df, "north_flow/latest.parquet")
@@ -320,7 +328,7 @@ def fetch_lhb() -> dict:
     today = _today_cn()
     start = (today - timedelta(days=7)).strftime("%Y%m%d")
     end = today.strftime("%Y%m%d")
-    df = _retry(ak.stock_lhb_detail_em, start_date=start, end_date=end)
+    df = _ak_call(ak.stock_lhb_detail_em, start_date=start, end_date=end)
     if df is None or df.empty:
         return {"rows": 0, "note": "no lhb rows in window"}
     _write_parquet(df, "lhb/latest.parquet")
@@ -329,7 +337,7 @@ def fetch_lhb() -> dict:
 
 
 def fetch_shareholders() -> dict:
-    df = _retry(ak.stock_zh_a_gdhs, symbol="最新")
+    df = _ak_call(ak.stock_zh_a_gdhs, symbol="最新")
     today = _today_cn().isoformat()
     df["as_of"] = today
     _write_parquet(df, "shareholders/latest.parquet")
@@ -357,7 +365,7 @@ def fetch_yjyg() -> dict:
     frames = []
     for q in quarters:
         try:
-            df = _retry(ak.stock_yjyg_em, date=q, tries=2)
+            df = _ak_call(ak.stock_yjyg_em, date=q)
             if df is not None and not df.empty:
                 df = df.copy()
                 df["report_period"] = q
@@ -376,14 +384,14 @@ def fetch_margin() -> dict:
     start = (datetime.now(CST) - timedelta(days=30)).strftime("%Y%m%d")
     total = 0
     try:
-        sse = _retry(ak.stock_margin_sse, start_date=start, end_date=today, tries=2)
+        sse = _ak_call(ak.stock_margin_sse, start_date=start, end_date=today)
         if not sse.empty:
             _write_parquet(sse, "margin/sse_latest.parquet")
             total += len(sse)
     except Exception as e:  # noqa: BLE001
         log.warning("  margin.sse failed: %s", e)
     try:
-        szse = _retry(ak.stock_margin_szse, date=today, tries=2)
+        szse = _ak_call(ak.stock_margin_szse, date=today)
         if not szse.empty:
             _write_parquet(szse, "margin/szse_latest.parquet")
             total += len(szse)
@@ -393,21 +401,20 @@ def fetch_margin() -> dict:
 
 
 def fetch_concepts() -> dict:
-    boards = _retry(ak.stock_board_concept_name_em)
+    """Concept boards + their constituent tickers. Serial to avoid bans."""
+    boards = _ak_call(ak.stock_board_concept_name_em)
     _write_parquet(boards, "concepts/boards.parquet")
     names = boards["板块名称"].tolist() if "板块名称" in boards.columns else []
 
     def one(name: str):
-        try:
-            m = _retry(ak.stock_board_concept_cons_em, symbol=name, tries=2)
-            if m is not None and not m.empty:
-                m = m.copy()
-                m["board"] = name
-                return m
-        except Exception:  # noqa: BLE001
-            return None
+        m = _ak_call(ak.stock_board_concept_cons_em, symbol=name)
+        if m is not None and not m.empty:
+            m = m.copy()
+            m["board"] = name
+            return m
+        return None
 
-    members = _per_ticker(names, one, workers=4, label="concept-members")
+    members = _per_ticker_serial(names, one, label="concept-members")
     kb = 0
     if not members.empty:
         kb = _write_parquet(members, "concepts/members.parquet")
@@ -415,21 +422,19 @@ def fetch_concepts() -> dict:
 
 
 def fetch_industries() -> dict:
-    boards = _retry(ak.stock_board_industry_name_em)
+    boards = _ak_call(ak.stock_board_industry_name_em)
     _write_parquet(boards, "industries/boards.parquet")
     names = boards["板块名称"].tolist() if "板块名称" in boards.columns else []
 
     def one(name: str):
-        try:
-            m = _retry(ak.stock_board_industry_cons_em, symbol=name, tries=2)
-            if m is not None and not m.empty:
-                m = m.copy()
-                m["board"] = name
-                return m
-        except Exception:  # noqa: BLE001
-            return None
+        m = _ak_call(ak.stock_board_industry_cons_em, symbol=name)
+        if m is not None and not m.empty:
+            m = m.copy()
+            m["board"] = name
+            return m
+        return None
 
-    members = _per_ticker(names, one, workers=4, label="industry-members")
+    members = _per_ticker_serial(names, one, label="industry-members")
     kb = 0
     if not members.empty:
         kb = _write_parquet(members, "industries/members.parquet")
@@ -439,7 +444,7 @@ def fetch_industries() -> dict:
 def fetch_research() -> dict:
     for sym in ("全部", "今日"):
         try:
-            df = _retry(ak.stock_research_report_em, symbol=sym, tries=2)
+            df = _ak_call(ak.stock_research_report_em, symbol=sym)
             if df is not None and not df.empty:
                 today = _today_cn().isoformat()
                 _write_parquet(df, "research/latest.parquet")
@@ -457,7 +462,7 @@ def fetch_news() -> dict:
         ("cls", lambda: ak.stock_info_global_cls(symbol="全部")),
     ):
         try:
-            df = _retry(fn, tries=2)
+            df = _retry(fn, tries=2)  # news doesn't hit eastmoney-hist — no throttle
             if df is not None and not df.empty:
                 df = df.copy()
                 df["source"] = label
