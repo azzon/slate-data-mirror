@@ -14,9 +14,9 @@ on:
         required: false
         default: "false"
       workers:
-        description: "Parallel workers (lower if rate-limited)"
+        description: "Parallel workers (lower if rate-limited or OOM)"
         required: false
-        default: "8"
+        default: "4"
       purge_existing:
         description: "Remove data/market_daily/ before backfill (true/false)"
         required: false

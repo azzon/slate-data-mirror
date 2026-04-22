@@ -104,7 +104,11 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
     # concurrency. Unlike Eastmoney, Tencent was stable at 8 workers for
     # 5500-ticker sweeps in prior slate nightly runs.
 
-    CHUNK = 200
+    # Lower chunk size: 1.6 GB aliyun box can't hold 200 tickers × 4 windows ×
+    # 1200 bars = ~1M rows in rows_by_date before flushing. Flushing smaller
+    # chunks keeps peak memory well under the OOM threshold that cooked the
+    # prior bootstrap run (took out sshd along with the worker).
+    CHUNK = 50
     processed_in_chunk = 0
     started = time.time()
 
