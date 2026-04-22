@@ -1,3 +1,4 @@
 akshare
+httpx
 pandas>=2.1
 pyarrow>=15.0

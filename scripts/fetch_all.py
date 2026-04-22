@@ -43,6 +43,13 @@ import akshare as ak
 import pandas as pd
 import requests
 
+# Tencent gtimg is our primary source for market_daily OHLCV — after
+# Eastmoney IP-banned us for the 16-worker akshare bulk run, we found
+# Tencent's qt/fqkline endpoints are independently rate-limited and
+# more tolerant. See project memory: project_akshare_rate_limit.md.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tencent_market as tm  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
 STATUS_FILE = DATA_DIR / "_status.json"
@@ -106,50 +113,59 @@ def _market_daily_path(d: date) -> Path:
 
 
 def fetch_securities() -> dict:
+    """Securities master list.
+
+    Prefer Tencent universe probe (same source that seeds market_daily so
+    we never get (ticker, trade_date) rows for a ticker missing from
+    securities). Falls back to akshare if Tencent is down.
+    """
+    try:
+        universe = tm.fetch_universe()
+        if universe:
+            df = pd.DataFrame([
+                {"code": u["ticker"].split(".")[0], "name": u["name"]}
+                for u in universe
+            ])
+            kb = _write_parquet(df, "securities/latest.parquet")
+            return {"rows": len(df), "size_kb": kb, "source": "tencent"}
+    except Exception as e:  # noqa: BLE001
+        log.warning("  tencent universe failed (%s) — falling back to akshare", e)
     df = _retry(ak.stock_info_a_code_name)
     kb = _write_parquet(df, "securities/latest.parquet")
-    return {"rows": len(df), "size_kb": kb}
+    return {"rows": len(df), "size_kb": kb, "source": "akshare"}
 
 
 def _fetch_one_day_bars(d: date) -> pd.DataFrame | None:
-    """Fetch OHLCV for all A-shares on a specific trade date via per-ticker hist.
+    """Fetch OHLCV for all A-shares on a specific trade date via Tencent gtimg.
 
-    `stock_zh_a_hist` is the reliable historical bar source — `spot_em` only
-    gives today's snapshot and returns intraday prices during market hours.
+    Tencent's qt.gtimg.cn / web.ifzq.gtimg.cn endpoints are independently
+    rate-limited from Eastmoney (which ban-hammered us for an akshare bulk
+    run). Tencent also returns 5 years of qfq history per call so this
+    function is reused for bootstrap — for a single-day fetch we just
+    filter to the target date after the call.
     """
-    sec = _retry(ak.stock_info_a_code_name)
-    codes = sec["code"].astype(str).tolist()
+    # Universe via Tencent probe (cheap, ~45s for full A-share)
+    universe = tm.fetch_universe()
+    tickers = [u["ticker"] for u in universe]
     start = end = d.strftime("%Y%m%d")
-    rows: list[pd.DataFrame] = []
+    bars_by_ticker = tm.fetch_daily_bars(tickers, start=start, end=end, max_workers=8)
 
-    def one(code: str):
-        try:
-            df = _retry(
-                ak.stock_zh_a_hist,
-                symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq",
-                tries=2,
-            )
-            if df is not None and not df.empty:
-                df = df.copy()
-                df["code"] = code
-                return df
-        except Exception:  # noqa: BLE001
-            return None
-
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        futures = {pool.submit(one, c): c for c in codes}
-        done = 0
-        for fut in as_completed(futures):
-            out = fut.result()
-            if out is not None:
-                rows.append(out)
-            done += 1
-            if done % 1000 == 0:
-                log.info("  market_daily %s: %d/%d", d, done, len(codes))
-
+    rows: list[dict] = []
+    for ticker, bars in bars_by_ticker.items():
+        code = ticker.split(".")[0]
+        for bar in bars:
+            if bar["trade_date"] != d.isoformat():
+                continue
+            rows.append({
+                "code": code, "ticker": ticker,
+                "trade_date": bar["trade_date"],
+                "open": bar["open"], "close": bar["close"],
+                "high": bar["high"], "low": bar["low"],
+                "volume": bar["volume"],
+            })
     if not rows:
         return None
-    return pd.concat(rows, ignore_index=True)
+    return pd.DataFrame(rows)
 
 
 def _is_trading_day(d: date) -> bool:
@@ -229,26 +245,43 @@ def _per_ticker(codes: list[str], fetch_one: Callable[[str], pd.DataFrame | None
 
 
 def fetch_financials() -> dict:
+    """Per-ticker full-history financial abstract.
+
+    Runs once/week (cadence_h=168). Uses 4 workers — financials_abstract
+    is the single most fragile AKShare endpoint on our infra: it already
+    tripped Eastmoney rate-limits at 6 workers. Keep slow and steady.
+    """
     sec = _retry(ak.stock_info_a_code_name)
     codes = sec["code"].astype(str).tolist()
 
+    ok_count = 0
+    fail_count = 0
+
     def one(code: str):
+        nonlocal ok_count, fail_count
         try:
             df = _retry(ak.stock_financial_abstract, symbol=code, tries=2)
             if df is not None and not df.empty:
                 df = df.copy()
                 df["code"] = code
+                ok_count += 1
                 return df
         except Exception:  # noqa: BLE001
+            fail_count += 1
             return None
+        fail_count += 1
+        return None
 
-    df = _per_ticker(codes, one, workers=6, label="financials")
+    df = _per_ticker(codes, one, workers=4, label="financials")
     if df.empty:
-        raise RuntimeError("financials returned 0 rows")
+        raise RuntimeError(f"financials returned 0 rows ({fail_count} failures)")
     today = _today_cn().isoformat()
     _write_parquet(df, "financials/latest.parquet")
     kb = _write_parquet(df, f"financials/history/{today}.parquet")
-    return {"rows": len(df), "size_kb": kb}
+    return {
+        "rows": len(df), "size_kb": kb,
+        "tickers_ok": ok_count, "tickers_fail": fail_count,
+    }
 
 
 def fetch_macro() -> dict:
@@ -374,7 +407,7 @@ def fetch_concepts() -> dict:
         except Exception:  # noqa: BLE001
             return None
 
-    members = _per_ticker(names, one, workers=8, label="concept-members")
+    members = _per_ticker(names, one, workers=4, label="concept-members")
     kb = 0
     if not members.empty:
         kb = _write_parquet(members, "concepts/members.parquet")
@@ -396,7 +429,7 @@ def fetch_industries() -> dict:
         except Exception:  # noqa: BLE001
             return None
 
-    members = _per_ticker(names, one, workers=8, label="industry-members")
+    members = _per_ticker(names, one, workers=4, label="industry-members")
     kb = 0
     if not members.empty:
         kb = _write_parquet(members, "industries/members.parquet")

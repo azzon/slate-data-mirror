@@ -31,31 +31,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import random
 import subprocess
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
-from http.client import RemoteDisconnected
 from pathlib import Path
-from urllib.error import URLError
 
-import akshare as ak
 import pandas as pd
-import requests
 
-TRANSIENT = (
-    RemoteDisconnected,
-    ConnectionError,
-    ConnectionResetError,
-    URLError,
-    requests.exceptions.ConnectionError,
-    requests.exceptions.ReadTimeout,
-    requests.exceptions.ChunkedEncodingError,
-    TimeoutError,
-)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tencent_market as tm  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
@@ -101,75 +86,31 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
     start = (today - timedelta(days=365 * years + 1)).strftime("%Y%m%d")
     end = today.strftime("%Y%m%d")
 
-    sec = ak.stock_info_a_code_name()
-    all_codes = sec["code"].astype(str).tolist()
+    # Universe from Tencent (cheap probe, ~45s). This also populates
+    # securities/latest.parquet consistency with fetch_all.py's source.
+    universe = tm.fetch_universe()
+    all_tickers = [u["ticker"] for u in universe]
     progress = _load_progress()
-    done = set(progress["market_daily"]["done_codes"])
-    failed = progress["market_daily"].get("failed_codes", {})  # code -> last_error
-    # Retry previously-failed codes this run
-    todo = [c for c in all_codes if c not in done]
+    done = set(progress["market_daily"]["done_codes"])  # Now stores tickers, not bare codes
+    failed = progress["market_daily"].get("failed_codes", {})
+    todo = [t for t in all_tickers if t not in done]
 
     log.info("market_daily bootstrap: %d total, %d done, %d remaining (of which %d previously failed)",
-             len(all_codes), len(done), len(todo), len(failed))
-    log.info("window: %s → %s, workers: %d", start, end, workers)
+             len(all_tickers), len(done), len(todo), len(failed))
+    log.info("window: %s → %s, workers: %d (Tencent gtimg)", start, end, workers)
 
-    # When the upstream rate-limits us (RemoteDisconnected wave), pause
-    # the whole pool until the error stream dies down. We track consecutive
-    # transient failures and back off exponentially if we see a burst.
-    rl_lock = threading.Lock()
-    rl_state = {"consecutive_fails": 0, "cool_until": 0.0}
-
-    def one(code: str):
-        # per-call jitter to avoid all workers hammering in lockstep
-        time.sleep(random.uniform(0.05, 0.25))
-
-        last_err: str | None = None
-        for attempt in range(1, 4):  # 3 tries max per ticker
-            # Respect an active cooldown window (set by peer workers)
-            while time.time() < rl_state["cool_until"]:
-                time.sleep(1)
-            try:
-                df = ak.stock_zh_a_hist(
-                    symbol=code, period="daily",
-                    start_date=start, end_date=end, adjust="qfq",
-                )
-            except TRANSIENT as e:
-                last_err = f"transient: {type(e).__name__}"
-                with rl_lock:
-                    rl_state["consecutive_fails"] += 1
-                    if rl_state["consecutive_fails"] >= 10:
-                        cool = min(30 * (2 ** min(rl_state["consecutive_fails"] // 10, 4)), 300)
-                        rl_state["cool_until"] = time.time() + cool
-                        log.warning("  rate-limit burst (%d consec) → cool %ds",
-                                    rl_state["consecutive_fails"], cool)
-                        rl_state["consecutive_fails"] = 0
-                if attempt < 3:
-                    time.sleep(random.uniform(1, 3) * attempt)
-                continue
-            except Exception as e:  # noqa: BLE001
-                return code, None, f"{type(e).__name__}: {str(e)[:100]}"
-
-            # Request succeeded — reset fail streak
-            with rl_lock:
-                rl_state["consecutive_fails"] = max(0, rl_state["consecutive_fails"] - 1)
-            if df is None or df.empty:
-                return code, None, "empty_response"
-            df = df.copy()
-            df["code"] = code
-            return code, df, None
-
-        return code, None, last_err or "max_retries"
+    # Tencent has its own internal keep-alive pool + worker management in
+    # tm.fetch_daily_bars. We batch per CHUNK tickers and let it manage
+    # concurrency. Unlike Eastmoney, Tencent was stable at 8 workers for
+    # 5500-ticker sweeps in prior slate nightly runs.
 
     CHUNK = 200
     processed_in_chunk = 0
     started = time.time()
 
-    # Track within-run progress separately so the progress JSON reflects
-    # *genuine* success.
     new_done: set[str] = set()
     new_failed: dict[str, str] = {}
 
-    # In-memory rows by date, flushed per CHUNK successful tickers.
     rows_by_date: dict[str, list[pd.DataFrame]] = {}
 
     def flush_chunk() -> None:
@@ -193,49 +134,66 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
         rows_by_date.clear()
         log.info("  flushed %d rows across %d dates", written, len(list(rows_by_date)))
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(one, c): c for c in todo}
-        completed = 0
-        for fut in as_completed(futures):
-            code, df, err = fut.result()
-            completed += 1
-            if err:
-                new_failed[code] = err
-            elif df is not None and not df.empty:
-                if "日期" in df.columns:
-                    df["trade_date"] = pd.to_datetime(df["日期"]).dt.strftime("%Y-%m-%d")
-                elif "trade_date" not in df.columns:
-                    candidate = next((c for c in df.columns if "date" in c.lower()), None)
-                    if candidate:
-                        df["trade_date"] = pd.to_datetime(df[candidate]).dt.strftime("%Y-%m-%d")
-                    else:
-                        new_failed[code] = f"no_date_col: {list(df.columns)[:5]}"
-                        continue
-                for trade_date, grp in df.groupby("trade_date"):
-                    rows_by_date.setdefault(trade_date, []).append(grp)
-                new_done.add(code)
-                processed_in_chunk += 1
+    # Process in CHUNK-sized ticker batches. Each batch hits Tencent
+    # via tm.fetch_daily_bars (max_workers=8 internally), flushes to
+    # parquet, checkpoints progress, and pushes.
+    completed = 0
+    for chunk_start in range(0, len(todo), CHUNK):
+        chunk = todo[chunk_start:chunk_start + CHUNK]
+        try:
+            bars_by_ticker = tm.fetch_daily_bars(
+                chunk, start=start, end=end, max_workers=workers
+            )
+        except Exception as e:  # noqa: BLE001
+            log.error("  chunk %d-%d failed: %s — skipping",
+                      chunk_start, chunk_start + len(chunk), e)
+            for t in chunk:
+                new_failed[t] = f"chunk_error: {type(e).__name__}"
+            continue
 
-            if completed % 100 == 0:
-                elapsed = time.time() - started
-                rate = completed / elapsed
-                eta_min = (len(todo) - completed) / rate / 60 if rate > 0 else 0
-                log.info("  progress: %d/%d ok=%d fail=%d (%.1f/s, eta %.1fm)",
-                         completed, len(todo), len(new_done), len(new_failed),
-                         rate, eta_min)
+        for ticker in chunk:
+            bars = bars_by_ticker.get(ticker, [])
+            if not bars:
+                new_failed[ticker] = "no_bars"
+                continue
+            code = ticker.split(".")[0]
+            df = pd.DataFrame([
+                {
+                    "code": code, "ticker": ticker,
+                    "trade_date": b["trade_date"],
+                    "open": b["open"], "close": b["close"],
+                    "high": b["high"], "low": b["low"],
+                    "volume": b["volume"],
+                }
+                for b in bars
+            ])
+            for trade_date, grp in df.groupby("trade_date"):
+                rows_by_date.setdefault(trade_date, []).append(grp)
+            new_done.add(ticker)
+            processed_in_chunk += 1
 
-            if processed_in_chunk >= CHUNK:
-                flush_chunk()
-                done.update(new_done)
-                progress["market_daily"]["done_codes"] = sorted(done)
-                progress["market_daily"]["failed_codes"] = new_failed
-                progress["market_daily"]["last_checkpoint"] = datetime.now(timezone.utc).isoformat()
-                _save_progress(progress)
-                _git_push(f"bootstrap(market_daily): +{processed_in_chunk} ok, "
-                          f"{len(new_failed)} fail ({len(done)}/{len(all_codes)} total)")
-                processed_in_chunk = 0
+        completed = chunk_start + len(chunk)
+        elapsed = time.time() - started
+        rate = completed / elapsed if elapsed > 0 else 0
+        eta_min = (len(todo) - completed) / rate / 60 if rate > 0 else 0
+        log.info("  batch done: %d/%d ok=%d fail=%d (%.1f ticker/s, eta %.1fm)",
+                 completed, len(todo), len(new_done), len(new_failed),
+                 rate, eta_min)
 
-    # Final flush
+        # Flush + checkpoint + push after every chunk.
+        flush_chunk()
+        done.update(new_done)
+        progress["market_daily"]["done_codes"] = sorted(done)
+        progress["market_daily"]["failed_codes"] = new_failed
+        progress["market_daily"]["last_checkpoint"] = datetime.now(timezone.utc).isoformat()
+        _save_progress(progress)
+        _git_push(
+            f"bootstrap(market_daily): +{processed_in_chunk} ok, "
+            f"{len(new_failed)} fail ({len(done)}/{len(all_tickers)} total)"
+        )
+        processed_in_chunk = 0
+
+    # Final flush (safety — chunk loop flushes every iter).
     flush_chunk()
     done.update(new_done)
     progress["market_daily"]["done_codes"] = sorted(done)
@@ -245,7 +203,7 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
     total_mins = (time.time() - started) / 60
     _git_push(
         f"bootstrap(market_daily): {len(new_done)} ok, {len(new_failed)} fail "
-        f"(total done {len(done)}/{len(all_codes)}, {years}y, {total_mins:.1f}m)"
+        f"(total done {len(done)}/{len(all_tickers)}, {years}y, {total_mins:.1f}m)"
     )
     log.info("market_daily bootstrap: ok=%d fail=%d in %.1f min",
              len(new_done), len(new_failed), total_mins)
