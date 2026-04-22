@@ -16,6 +16,17 @@ RUNNER_USER="${RUNNER_USER:-runner}"
 RUNNER_HOME="/home/${RUNNER_USER}"
 RUNNER_DIR="${RUNNER_HOME}/actions-runner"
 
+# GitHub release CDN (objects.githubusercontent.com) is throttled from
+# mainland China. Try several community CN proxies first; fall back to
+# upstream. All of them stream bytes verbatim from GitHub, so the
+# tarball is identical — we still validate with `tar -tzf` before extract.
+DOWNLOAD_MIRRORS=(
+    "https://gh-proxy.com/https://github.com"
+    "https://ghfast.top/https://github.com"
+    "https://mirror.ghproxy.com/https://github.com"
+    "https://github.com"
+)
+
 if [ -z "${REG_TOKEN:-}" ]; then
     echo "!! REG_TOKEN not set. Get one with:"
     echo "   gh api -X POST /repos/${REPO_OWNER}/${REPO_NAME}/actions/runners/registration-token"
@@ -68,9 +79,37 @@ mkdir -p "$RUNNER_DIR"
 chown "$RUNNER_USER:$RUNNER_USER" "$RUNNER_DIR"
 if [ ! -f "$RUNNER_DIR/run.sh" ]; then
     TARBALL="actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
-    sudo -u "$RUNNER_USER" bash -c "cd '$RUNNER_DIR' && \
-        curl -fsSL -o '$TARBALL' 'https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${TARBALL}' && \
-        tar xzf '$TARBALL' && rm -f '$TARBALL'"
+    REL_PATH="/actions/runner/releases/download/v${RUNNER_VERSION}/${TARBALL}"
+    # clear any half-downloaded file from a previous stuck attempt
+    rm -f "$RUNNER_DIR/$TARBALL"
+
+    ok=0
+    for base in "${DOWNLOAD_MIRRORS[@]}"; do
+        url="${base}${REL_PATH}"
+        echo "   trying ${url}"
+        # --connect-timeout so we bail fast on a dead mirror
+        # --max-time 600 caps at 10 min per attempt
+        # --retry / --retry-max-time smooths over single-packet drops
+        if sudo -u "$RUNNER_USER" curl -fL --connect-timeout 15 --max-time 600 \
+                --retry 3 --retry-max-time 60 --retry-connrefused \
+                --progress-bar \
+                -o "$RUNNER_DIR/$TARBALL" \
+                "$url"; then
+            if sudo -u "$RUNNER_USER" tar -tzf "$RUNNER_DIR/$TARBALL" >/dev/null 2>&1; then
+                echo "   ✓ downloaded via ${base}"
+                ok=1
+                break
+            else
+                echo "   ✗ corrupt tarball from ${base}"
+                rm -f "$RUNNER_DIR/$TARBALL"
+            fi
+        else
+            rm -f "$RUNNER_DIR/$TARBALL"
+        fi
+    done
+    [ "$ok" = "1" ] || { echo "!! all mirrors failed" >&2; exit 1; }
+
+    sudo -u "$RUNNER_USER" bash -c "cd '$RUNNER_DIR' && tar xzf '$TARBALL' && rm -f '$TARBALL'"
 fi
 
 echo "==> (re)register runner"
