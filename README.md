@@ -1,67 +1,67 @@
-# slate-akshare-mirror
+# slate-data-mirror
 
-Mirror of AKShare data to a private GitHub repo, so slate deploys behind
-corporate proxies (that can't reach `push2.eastmoney.com` / `finance.sina.com.cn`
-/ `macro.sina.com.cn`) can pull pre-fetched Parquet instead of calling
-AKShare directly.
+Public mirror of Chinese-market data from AKShare, fetched by a
+**self-hosted GitHub Actions runner** inside mainland China (the
+upstream sources — Eastmoney, Sina, CNInfo, SSE/SZSE — geo-block
+overseas IPs, so GitHub-hosted runners don't work).
 
-**Upstream sources mirrored** (8 AKShare endpoints covering the 4 slate tables
-fed by AKShare: `securities`, `market_daily`, `financials_quarterly`, `macro_daily`):
+Consumed by [slate](https://github.com/azzon/slate) deploys running
+behind corporate proxies that cannot reach the upstream sources
+directly.
 
-| Group | AKShare function | Output |
-|---|---|---|
-| securities | `stock_info_a_code_name` | `data/securities/latest.parquet` |
-| market_daily | `stock_zh_a_spot_em` (today) / `stock_zh_a_hist` (backfill) | `data/market_daily/YYYY-MM-DD.parquet` |
-| financials | `stock_financial_abstract` (per-ticker, ~5600) | `data/financials/latest.parquet` + dated snapshot |
-| macro | `macro_china_{pmi,cpi,money_supply,shibor}_*` | `data/macro/{pmi,cpi,m2,shibor}.parquet` |
+## What's mirrored
 
-Daily `market_daily` snapshot is ~2 MB; full financials snapshot is ~50-80 MB.
-Repo grows ~60 MB/month steady-state.
+| Group | AKShare source | Cadence | Layout |
+|---|---|---|---|
+| `securities/` | `stock_info_a_code_name` | 1×/day | `latest.parquet` |
+| `market_daily/` | `stock_zh_a_spot_em` | up to 4×/day | `YYYY/YYYY-MM-DD.parquet` |
+| `financials/` | `stock_financial_abstract` (per-ticker) | 1×/day | `latest.parquet` + `history/YYYY-MM-DD.parquet` |
+| `macro/` | `macro_china_{pmi,cpi,money_supply,shibor}_*` | 1×/day | `{pmi,cpi,m2,shibor}.parquet` |
+| `north_flow/` | `stock_hsgt_hold_stock_em` | 1×/day | `latest.parquet` + `history/` |
+| `lhb/` | `stock_lhb_detail_em` (rolling 7d) | 1×/day | `latest.parquet` + `history/` |
+| `shareholders/` | `stock_zh_a_gdhs` | weekly | `latest.parquet` + `history/` |
+| `yjyg/` | `stock_yjyg_em` (last 4 quarters) | 1×/day | `latest.parquet` |
+| `margin/` | `stock_margin_sse` + `stock_margin_szse` | 1×/day | `{sse,szse}_latest.parquet` |
+| `concepts/` | `stock_board_concept_{name,cons}_em` | every 2d | `boards.parquet` + `members.parquet` |
+| `industries/` | `stock_board_industry_{name,cons}_em` | every 2d | `boards.parquet` + `members.parquet` |
+| `research/` | `stock_research_report_em` | 1×/day | `latest.parquet` + `history/` |
+| `news/` | `news_cctv` + `stock_info_global_cls` | up to 4×/day | `{cctv,cls}/YYYY-MM-DD.parquet` |
+| `_status.json` | per-endpoint freshness + last error | every pass | root of `data/` |
 
-## Setup (on the China-side server)
+## How it runs
 
-```bash
-git clone https://github.com/azzon/slate-akshare-mirror.git
-cd slate-akshare-mirror
-cp .env.example .env
-# edit .env: paste GITHUB_TOKEN (fine-grained PAT, Contents: read+write, this repo only)
+1. GitHub Actions cron fires 5×/day (`.github/workflows/mirror.yml`).
+2. Workflow runs on the self-hosted runner (mainland IP).
+3. Runner installs latest `akshare` from PyPI (AKShare ships
+   anti-scrape fixes in patch releases — we always take the newest).
+4. `scripts/fetch_all.py` iterates all endpoints, skipping any whose
+   cadence isn't due, writes Parquet, updates `data/_status.json`.
+5. Workflow commits `data/` diff and pushes via SSH remote
+   (HTTPS to `github.com` is flaky from China ISPs).
 
-bash scripts/install.sh
+Each endpoint is independent: one failure doesn't abort the pass.
+
+## Manual ops
+
+Re-run an endpoint immediately, from the Actions tab:
+
+```
+workflow_dispatch → only = "market_daily,north_flow"
 ```
 
-`install.sh` is idempotent:
-- creates `.venv` + installs `requirements.txt`
-- renders `systemd/*.service`/`*.timer` with absolute paths
-- installs them as user units at `~/.config/systemd/user/`
-- enables + starts the timer (01:30 CST daily)
+Or force everything:
 
-Verify:
-
-```bash
-systemctl --user list-timers akshare-mirror.timer
-systemctl --user status akshare-mirror.service
-journalctl --user -u akshare-mirror.service -n 100
+```
+workflow_dispatch → force = true
 ```
 
-## Manual / ad-hoc runs
+## Freshness
 
-```bash
-.venv/bin/python scripts/fetch_and_push.py                          # standard daily pass
-AKSHARE_MIRROR_SKIP_PUSH=1 .venv/bin/python scripts/fetch_and_push.py    # dry run
-AKSHARE_MIRROR_DAYS_BACK=30 .venv/bin/python scripts/fetch_and_push.py   # backfill last 30 days
-AKSHARE_MIRROR_SKIP_FINANCIALS=1 .venv/bin/python scripts/fetch_and_push.py  # skip the slow part
-```
+`data/_status.json` carries for each endpoint: `last_success`,
+`last_elapsed_s`, `fail_streak`, `last_error`. slate reads this and
+caveats any answer that depends on stale data.
 
-## Consuming on the slate side
+## License
 
-Not wired yet — slate continues to hit AKShare directly (with Tencent as
-primary for market_daily/securities). When the US-side proxy wall is
-confirmed to block AKShare, add a loader that reads `data/*/latest.parquet`
-and upserts into DuckDB before `slate nightly` runs. That's a slate-side
-change, not this repo's concern.
-
-## Token rotation
-
-The PAT is only stored in `.env` on the China server (mode 0600, git-ignored).
-If it leaks, revoke at https://github.com/settings/tokens and re-run
-`install.sh` after updating `.env`.
+Code: MIT. Data: relayed from upstream sources; use at your own
+risk, subject to their terms.
