@@ -31,15 +31,31 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
+from http.client import RemoteDisconnected
 from pathlib import Path
+from urllib.error import URLError
 
 import akshare as ak
 import pandas as pd
+import requests
+
+TRANSIENT = (
+    RemoteDisconnected,
+    ConnectionError,
+    ConnectionResetError,
+    URLError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ReadTimeout,
+    requests.exceptions.ChunkedEncodingError,
+    TimeoutError,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
@@ -80,7 +96,7 @@ def _git_push(msg: str) -> None:
         log.warning("  git push failed: %s", (p.stderr or p.stdout or "").strip()[-200:])
 
 
-def bootstrap_market_daily(years: int) -> None:
+def bootstrap_market_daily(years: int, workers: int = 8) -> None:
     today = date.today()
     start = (today - timedelta(days=365 * years + 1)).strftime("%Y%m%d")
     end = today.strftime("%Y%m%d")
@@ -89,34 +105,72 @@ def bootstrap_market_daily(years: int) -> None:
     all_codes = sec["code"].astype(str).tolist()
     progress = _load_progress()
     done = set(progress["market_daily"]["done_codes"])
+    failed = progress["market_daily"].get("failed_codes", {})  # code -> last_error
+    # Retry previously-failed codes this run
     todo = [c for c in all_codes if c not in done]
 
-    log.info("market_daily bootstrap: %d codes total, %d already done, %d remaining",
-             len(all_codes), len(done), len(todo))
-    log.info("window: %s → %s", start, end)
+    log.info("market_daily bootstrap: %d total, %d done, %d remaining (of which %d previously failed)",
+             len(all_codes), len(done), len(todo), len(failed))
+    log.info("window: %s → %s, workers: %d", start, end, workers)
 
-    # Per-ticker bulk fetch → in-memory dict { date → list[row] }
-    # We flush to parquet in 200-ticker chunks to keep memory bounded
-    # and to checkpoint progress.
-
-    rows_by_date: dict[str, list[pd.DataFrame]] = {}
+    # When the upstream rate-limits us (RemoteDisconnected wave), pause
+    # the whole pool until the error stream dies down. We track consecutive
+    # transient failures and back off exponentially if we see a burst.
+    rl_lock = threading.Lock()
+    rl_state = {"consecutive_fails": 0, "cool_until": 0.0}
 
     def one(code: str):
-        try:
-            df = ak.stock_zh_a_hist(
-                symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq",
-            )
-            if df is not None and not df.empty:
-                df = df.copy()
-                df["code"] = code
-                return code, df
-        except Exception as e:  # noqa: BLE001
-            log.debug("  %s failed: %s", code, e)
-        return code, None
+        # per-call jitter to avoid all workers hammering in lockstep
+        time.sleep(random.uniform(0.05, 0.25))
+
+        last_err: str | None = None
+        for attempt in range(1, 4):  # 3 tries max per ticker
+            # Respect an active cooldown window (set by peer workers)
+            while time.time() < rl_state["cool_until"]:
+                time.sleep(1)
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=code, period="daily",
+                    start_date=start, end_date=end, adjust="qfq",
+                )
+            except TRANSIENT as e:
+                last_err = f"transient: {type(e).__name__}"
+                with rl_lock:
+                    rl_state["consecutive_fails"] += 1
+                    if rl_state["consecutive_fails"] >= 10:
+                        cool = min(30 * (2 ** min(rl_state["consecutive_fails"] // 10, 4)), 300)
+                        rl_state["cool_until"] = time.time() + cool
+                        log.warning("  rate-limit burst (%d consec) → cool %ds",
+                                    rl_state["consecutive_fails"], cool)
+                        rl_state["consecutive_fails"] = 0
+                if attempt < 3:
+                    time.sleep(random.uniform(1, 3) * attempt)
+                continue
+            except Exception as e:  # noqa: BLE001
+                return code, None, f"{type(e).__name__}: {str(e)[:100]}"
+
+            # Request succeeded — reset fail streak
+            with rl_lock:
+                rl_state["consecutive_fails"] = max(0, rl_state["consecutive_fails"] - 1)
+            if df is None or df.empty:
+                return code, None, "empty_response"
+            df = df.copy()
+            df["code"] = code
+            return code, df, None
+
+        return code, None, last_err or "max_retries"
 
     CHUNK = 200
     processed_in_chunk = 0
     started = time.time()
+
+    # Track within-run progress separately so the progress JSON reflects
+    # *genuine* success.
+    new_done: set[str] = set()
+    new_failed: dict[str, str] = {}
+
+    # In-memory rows by date, flushed per CHUNK successful tickers.
+    rows_by_date: dict[str, list[pd.DataFrame]] = {}
 
     def flush_chunk() -> None:
         if not rows_by_date:
@@ -139,51 +193,62 @@ def bootstrap_market_daily(years: int) -> None:
         rows_by_date.clear()
         log.info("  flushed %d rows across %d dates", written, len(list(rows_by_date)))
 
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(one, c): c for c in todo}
         completed = 0
         for fut in as_completed(futures):
-            code, df = fut.result()
+            code, df, err = fut.result()
             completed += 1
-            if df is not None and not df.empty:
+            if err:
+                new_failed[code] = err
+            elif df is not None and not df.empty:
                 if "日期" in df.columns:
                     df["trade_date"] = pd.to_datetime(df["日期"]).dt.strftime("%Y-%m-%d")
                 elif "trade_date" not in df.columns:
-                    # AKShare sometimes returns English column name
                     candidate = next((c for c in df.columns if "date" in c.lower()), None)
                     if candidate:
                         df["trade_date"] = pd.to_datetime(df[candidate]).dt.strftime("%Y-%m-%d")
                     else:
-                        log.warning("    %s: no date column found (%s)", code, list(df.columns))
-                        done.add(code)
+                        new_failed[code] = f"no_date_col: {list(df.columns)[:5]}"
                         continue
                 for trade_date, grp in df.groupby("trade_date"):
                     rows_by_date.setdefault(trade_date, []).append(grp)
-            done.add(code)
-            processed_in_chunk += 1
+                new_done.add(code)
+                processed_in_chunk += 1
 
             if completed % 100 == 0:
                 elapsed = time.time() - started
                 rate = completed / elapsed
                 eta_min = (len(todo) - completed) / rate / 60 if rate > 0 else 0
-                log.info("  progress: %d/%d (%.1f/s, eta %.1fm)",
-                         completed, len(todo), rate, eta_min)
+                log.info("  progress: %d/%d ok=%d fail=%d (%.1f/s, eta %.1fm)",
+                         completed, len(todo), len(new_done), len(new_failed),
+                         rate, eta_min)
 
             if processed_in_chunk >= CHUNK:
                 flush_chunk()
+                done.update(new_done)
                 progress["market_daily"]["done_codes"] = sorted(done)
+                progress["market_daily"]["failed_codes"] = new_failed
                 progress["market_daily"]["last_checkpoint"] = datetime.now(timezone.utc).isoformat()
                 _save_progress(progress)
-                _git_push(f"bootstrap(market_daily): +{CHUNK} tickers ({completed}/{len(todo)})")
+                _git_push(f"bootstrap(market_daily): +{processed_in_chunk} ok, "
+                          f"{len(new_failed)} fail ({len(done)}/{len(all_codes)} total)")
                 processed_in_chunk = 0
 
     # Final flush
     flush_chunk()
+    done.update(new_done)
     progress["market_daily"]["done_codes"] = sorted(done)
+    progress["market_daily"]["failed_codes"] = new_failed
     progress["market_daily"]["completed_at"] = datetime.now(timezone.utc).isoformat()
     _save_progress(progress)
-    _git_push(f"bootstrap(market_daily): complete ({len(all_codes)} tickers, {years}y)")
-    log.info("market_daily bootstrap complete in %.1f min", (time.time() - started) / 60)
+    total_mins = (time.time() - started) / 60
+    _git_push(
+        f"bootstrap(market_daily): {len(new_done)} ok, {len(new_failed)} fail "
+        f"(total done {len(done)}/{len(all_codes)}, {years}y, {total_mins:.1f}m)"
+    )
+    log.info("market_daily bootstrap: ok=%d fail=%d in %.1f min",
+             len(new_done), len(new_failed), total_mins)
 
 
 def bootstrap_financials() -> None:
@@ -205,6 +270,8 @@ def main() -> int:
     p.add_argument("--resume", action="store_true",
                    help="continue from _bootstrap_progress.json (default if file exists)")
     p.add_argument("--reset", action="store_true", help="ignore prior progress")
+    p.add_argument("--workers", type=int, default=8,
+                   help="concurrent workers (tune down if rate-limited)")
     args = p.parse_args()
 
     if args.reset and PROGRESS_FILE.exists():
@@ -213,7 +280,7 @@ def main() -> int:
     only = [s.strip() for s in args.only.split(",")] if args.only else ["market_daily"]
 
     if "market_daily" in only:
-        bootstrap_market_daily(years=args.years)
+        bootstrap_market_daily(years=args.years, workers=args.workers)
     if "financials" in only:
         bootstrap_financials()
     if "macro" in only:

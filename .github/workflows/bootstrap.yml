@@ -13,6 +13,14 @@ on:
         description: "Discard prior progress and start over (true/false)"
         required: false
         default: "false"
+      workers:
+        description: "Parallel workers (lower if rate-limited)"
+        required: false
+        default: "8"
+      purge_existing:
+        description: "Remove data/market_daily/ before backfill (true/false)"
+        required: false
+        default: "false"
 
 concurrency:
   group: bootstrap
@@ -53,11 +61,23 @@ jobs:
           git config user.name "slate-mirror-bot"
           git remote set-url origin git@github.com:azzon/slate-data-mirror.git
 
+      - name: Purge existing market_daily (if requested)
+        if: github.event.inputs.purge_existing == 'true'
+        run: |
+          rm -rf data/market_daily
+          rm -f data/_bootstrap_progress.json
+          git add -A data/
+          if ! git diff --cached --quiet; then
+            git commit -m "bootstrap: purge market_daily before rebuild"
+            git push origin HEAD:main
+          fi
+
       - name: Backfill
         env:
           YEARS: ${{ github.event.inputs.years }}
           RESET: ${{ github.event.inputs.reset }}
+          WORKERS: ${{ github.event.inputs.workers }}
         run: |
-          args="--years $YEARS"
+          args="--years $YEARS --workers ${WORKERS:-8}"
           if [ "$RESET" = "true" ]; then args="$args --reset"; fi
           .venv/bin/python scripts/bootstrap_history.py $args
