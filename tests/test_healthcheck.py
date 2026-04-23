@@ -186,3 +186,35 @@ def test_row_count_floor_absent_endpoint_no_alert(tmp_path, monkeypatch, capsys)
     healthcheck.main()
     out = capsys.readouterr().out
     assert not out.startswith("ALERT")
+
+
+def test_stale_last_pass_alerts(tmp_path, monkeypatch, capsys):
+    """Global heartbeat: if last_pass.at > 8h ago, alert regardless of
+    individual endpoint states. Catches the 'single long workflow hogging
+    the runner' scenario where individual endpoints look healthy but no
+    cron pass actually fires."""
+    fresh_ep = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    old_pass = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+    _patch_status(tmp_path, monkeypatch, {
+        "endpoints": {"news": {"last_success": fresh_ep, "fail_streak": 0}},
+        "last_pass": {"at": old_pass, "succeeded": 8, "failed": 0},
+    })
+    import healthcheck
+    healthcheck.main()
+    out = capsys.readouterr().out
+    assert out.startswith("ALERT")
+    assert "_heartbeat" in out
+    assert "12.0h" in out
+
+
+def test_fresh_last_pass_no_alert(tmp_path, monkeypatch, capsys):
+    """Recent last_pass → no heartbeat alert."""
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    _patch_status(tmp_path, monkeypatch, {
+        "endpoints": {"news": {"last_success": fresh, "fail_streak": 0}},
+        "last_pass": {"at": fresh, "succeeded": 8},
+    })
+    import healthcheck
+    healthcheck.main()
+    out = capsys.readouterr().out
+    assert not out.startswith("ALERT")

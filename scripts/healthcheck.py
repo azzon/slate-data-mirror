@@ -75,6 +75,25 @@ def main() -> int:
     ok_count = 0
     now = datetime.now(timezone.utc)
 
+    # Global heartbeat check — `last_pass.at` is when ANY mirror pass
+    # finished. If it's been >8h since ANY pass (fast, market, slow)
+    # touched the repo, the runner or workflow scheduling itself is
+    # the problem, not a specific endpoint. Catches the case where a
+    # single long-running workflow (e.g. slow) is hogging the runner
+    # and all the fast crons are queueing/cancelling.
+    last_pass = data.get("last_pass", {})
+    last_pass_at = last_pass.get("at")
+    if last_pass_at:
+        try:
+            pass_age_h = (now - datetime.fromisoformat(last_pass_at)).total_seconds() / 3600
+            if pass_age_h > 8:
+                issues.append(
+                    f"- `_heartbeat`: last_pass was {pass_age_h:.1f}h ago "
+                    f"(>8h threshold) — check runner / slow-workflow contention"
+                )
+        except ValueError:
+            issues.append(f"- `_heartbeat`: bad last_pass.at `{last_pass_at}`")
+
     for name, ep in sorted(eps.items()):
         cadence_h = CADENCE_H.get(name, 24)
         fail_streak = ep.get("fail_streak", 0)

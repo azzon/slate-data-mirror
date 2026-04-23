@@ -1,24 +1,33 @@
-name: Mirror slow endpoints (weekly + daily retry)
+name: Mirror slow endpoints (chunked)
 
-# Per-ticker bulk endpoints that burn a lot of AKShare calls:
-# financials, concepts, industries, research, shareholders.
+# Per-ticker bulk endpoints. Each individual endpoint can take hours
+# (financials ~3h, research ~3.5h, concepts ~20m, industries ~20m,
+# shareholders ~5m). Running all of them serially was 7+ hours —
+# exceeded GitHub's 6h job limit AND blocked the single-runner fast
+# crons for a whole day.
 #
-# Strictly serial fetch with MIRROR_AKSHARE_SLEEP=2s between calls.
-# ~5500 tickers × 2s = ~3h for financials. Concepts/industries are
-# a few hundred boards each (much faster).
+# Solution: run ONE endpoint group per trigger. Three weekly chunks:
+#   Sun 03:00 CST → financials + shareholders (~3.2h)
+#   Wed 03:00 CST → research (~3.5h)
+#   Fri 03:00 CST → concepts + industries (~40m)
 #
-# Primary schedule: Sun 03:00 CST. Plus a daily 02:30 CST pre-check —
-# if the last successful pass is older than 6 days, run it now. That
-# way a failed weekly run self-heals on Mon/Tue instead of waiting a
-# full week.
+# Plus a daily Mon-Sat 02:30 CST pre-check that fills in whichever
+# weekly chunks are overdue (>6 days since last success for that
+# chunk's anchor endpoint).
 on:
   schedule:
-    - cron: "0 19 * * 6"   # Sat 19:00 UTC = Sun 03:00 CST (primary)
-    - cron: "30 18 * * 0,1,2,3,4,5"  # Mon-Sat 18:30 UTC = 02:30 CST (retry)
+    # Sun 19:00 UTC = Sun 03:00 CST (financials + shareholders)
+    - cron: "0 19 * * 6"
+    # Tue 19:00 UTC = Wed 03:00 CST (research)
+    - cron: "0 19 * * 2"
+    # Thu 19:00 UTC = Fri 03:00 CST (concepts + industries)
+    - cron: "0 19 * * 4"
+    # Daily 18:30 UTC = 02:30 CST (retry for missed chunks)
+    - cron: "30 18 * * *"
   workflow_dispatch:
     inputs:
       only:
-        description: "Comma-separated endpoint names (empty = all slow)"
+        description: "Comma-separated endpoint names (empty = picked by cron slot)"
         required: false
         default: ""
       force:
@@ -27,14 +36,14 @@ on:
         default: "false"
 
 concurrency:
-  # Own group so the 3h weekly pass doesn't block fast/market crons.
   group: mirror-slow
   cancel-in-progress: false
 
 jobs:
   fetch-slow:
     runs-on: self-hosted
-    timeout-minutes: 360
+    # 4h hard cap per chunk — each chunk sized to fit comfortably.
+    timeout-minutes: 240
     steps:
       - name: Checkout via SSH-over-443
         timeout-minutes: 5
@@ -65,39 +74,69 @@ jobs:
           git config user.name "slate-mirror-bot"
           git remote set-url origin git@github.com:azzon/slate-data-mirror.git
 
-      - name: Decide whether to run
+      - name: Decide which chunk + whether to run
         id: decide
         env:
           FORCE: ${{ github.event.inputs.force }}
           EVENT: ${{ github.event_name }}
           CRON: ${{ github.event.schedule }}
+          INPUT_ONLY: ${{ github.event.inputs.only }}
         run: |
-          # Always run on manual dispatch or on the primary (Sun) cron.
-          # For the Mon-Sat retry cron, only run if the last successful
-          # financials pass is >6 days ago (i.e. a primary run was missed
-          # or failed).
-          if [ "$EVENT" = "workflow_dispatch" ] || [ "$FORCE" = "true" ]; then
-            echo "run=yes" >> "$GITHUB_OUTPUT"; echo "reason=manual"; exit 0
+          # Manual dispatch with explicit `only` → run exactly that
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$INPUT_ONLY" ]; then
+            echo "endpoints=$INPUT_ONLY" >> "$GITHUB_OUTPUT"
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+            echo "reason=manual_explicit"
+            exit 0
           fi
-          if [ "$CRON" = "0 19 * * 6" ]; then
-            echo "run=yes" >> "$GITHUB_OUTPUT"; echo "reason=primary"; exit 0
+          # Manual dispatch with force (no endpoints specified) → Sunday's chunk
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$FORCE" = "true" ]; then
+            echo "endpoints=financials,shareholders" >> "$GITHUB_OUTPUT"
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+            echo "reason=manual_force"
+            exit 0
           fi
-          # Retry cron — delegate to scripts/slow_decide.py (one
-          # key=value per line; whitespace-safe).
-          python3 scripts/slow_decide.py | tee /tmp/slow_decide.out
-          run_val=$(grep -E '^run=' /tmp/slow_decide.out | head -1 | cut -d= -f2-)
-          echo "run=${run_val}" >> "$GITHUB_OUTPUT"
+          # Primary crons — each picks its own chunk
+          case "$CRON" in
+            "0 19 * * 6")
+              echo "endpoints=financials,shareholders" >> "$GITHUB_OUTPUT"
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+              echo "reason=sun_primary"
+              ;;
+            "0 19 * * 2")
+              echo "endpoints=research" >> "$GITHUB_OUTPUT"
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+              echo "reason=wed_primary"
+              ;;
+            "0 19 * * 4")
+              echo "endpoints=concepts,industries" >> "$GITHUB_OUTPUT"
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+              echo "reason=fri_primary"
+              ;;
+            "30 18 * * *")
+              # Retry cron — scripts/slow_decide.py emits the stalest chunk.
+              python3 scripts/slow_decide.py | tee /tmp/slow_decide.out
+              run_val=$(grep -E '^run=' /tmp/slow_decide.out | head -1 | cut -d= -f2-)
+              echo "run=${run_val}" >> "$GITHUB_OUTPUT"
+              if [ "$run_val" = "yes" ]; then
+                  endpoints_val=$(grep -E '^endpoints=' /tmp/slow_decide.out | head -1 | cut -d= -f2-)
+                  echo "endpoints=${endpoints_val}" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            *)
+              echo "run=no" >> "$GITHUB_OUTPUT"
+              echo "reason=unknown_cron"
+              ;;
+          esac
 
-      - name: Fetch slow endpoints
+      - name: Fetch chunk
         if: steps.decide.outputs.run == 'yes'
         env:
-          ONLY: ${{ github.event.inputs.only }}
+          ENDPOINTS: ${{ steps.decide.outputs.endpoints }}
           MIRROR_AKSHARE_SLEEP: "2.0"
         run: |
-          if [ -z "$ONLY" ]; then
-            ONLY="shareholders,concepts,industries,research,financials"
-          fi
-          .venv/bin/python scripts/fetch_all.py --only $ONLY
+          echo "Running endpoints: $ENDPOINTS"
+          .venv/bin/python scripts/fetch_all.py --only "$ENDPOINTS"
 
       - name: Final sweep push
         if: always()
@@ -107,7 +146,7 @@ jobs:
             echo "nothing to sweep"
             exit 0
           fi
-          git commit -m "data: slow sweep $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -m "data: slow chunk sweep $(date -u +%Y-%m-%dT%H:%MZ)"
           git push origin HEAD:main
 
       - name: Prune old history snapshots
