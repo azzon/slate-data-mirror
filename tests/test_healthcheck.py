@@ -136,3 +136,53 @@ def test_missing_last_success_alerts(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert out.startswith("ALERT")
     assert "no last_success" in out
+
+
+def test_row_count_floor_trips(tmp_path, monkeypatch, capsys):
+    """Fresh last_success but rows below floor → ALERT."""
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    eps = {
+        "securities": {
+            "last_success": fresh, "fail_streak": 0,
+            "last_meta": {"rows": 42},  # way below 4500 floor
+        },
+    }
+    _patch_status(tmp_path, monkeypatch, {"endpoints": eps})
+    import healthcheck
+    healthcheck.main()
+    out = capsys.readouterr().out
+    assert out.startswith("ALERT")
+    assert "rows=42" in out
+    assert "floor=4500" in out
+
+
+def test_row_count_floor_passes(tmp_path, monkeypatch, capsys):
+    """Healthy row counts don't trip the floor."""
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    eps = {
+        "securities": {
+            "last_success": fresh, "fail_streak": 0,
+            "last_meta": {"rows": 5648},
+        },
+    }
+    _patch_status(tmp_path, monkeypatch, {"endpoints": eps})
+    import healthcheck
+    healthcheck.main()
+    out = capsys.readouterr().out
+    assert not out.startswith("ALERT")
+
+
+def test_row_count_floor_absent_endpoint_no_alert(tmp_path, monkeypatch, capsys):
+    """Endpoints without a MIN_ROWS entry (news, lhb) don't alert on low rows."""
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    eps = {
+        "news": {
+            "last_success": fresh, "fail_streak": 0,
+            "last_meta": {"rows": 0},
+        },
+    }
+    _patch_status(tmp_path, monkeypatch, {"endpoints": eps})
+    import healthcheck
+    healthcheck.main()
+    out = capsys.readouterr().out
+    assert not out.startswith("ALERT")

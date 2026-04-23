@@ -205,10 +205,25 @@ def _fetch_one_day_bars(d: date) -> pd.DataFrame | None:
     run). Tencent also returns 5 years of qfq history per call so this
     function is reused for bootstrap — for a single-day fetch we just
     filter to the target date after the call.
+
+    Also stamps `market_cap` from the Tencent universe probe's `total_mv_yi`
+    (in 亿元, converted to CNY) so the consumer side doesn't need a second
+    Tencent round-trip. This is TODAY's market cap for every ticker; for
+    backfill days we leave it NULL because Tencent's qfq-history endpoint
+    doesn't emit historical market cap.
     """
-    # Universe via Tencent probe (cheap, ~45s for full A-share)
+    # Universe via Tencent probe — carries total_mv_yi so we can stamp
+    # today's market_cap into the parquet.
     universe = tm.fetch_universe()
     tickers = [u["ticker"] for u in universe]
+    # Build a ticker → market_cap_cny map for today's fetch only.
+    today = _today_cn()
+    cap_by_ticker: dict[str, float | None] = {}
+    if d == today:
+        for u in universe:
+            mv_yi = u.get("total_mv_yi")
+            if mv_yi is not None:
+                cap_by_ticker[u["ticker"]] = mv_yi * 1e8  # 亿元 → 元
     start = end = d.strftime("%Y%m%d")
     bars_by_ticker = tm.fetch_daily_bars(tickers, start=start, end=end, max_workers=8)
 
@@ -224,6 +239,7 @@ def _fetch_one_day_bars(d: date) -> pd.DataFrame | None:
                 "open": bar["open"], "close": bar["close"],
                 "high": bar["high"], "low": bar["low"],
                 "volume": bar["volume"],
+                "market_cap": cap_by_ticker.get(ticker),  # None for backfill days
             })
     if not rows:
         return None
@@ -647,7 +663,17 @@ def fetch_industries() -> dict:
 def fetch_research() -> dict:
     """Per-ticker research reports. AKShare's API changed — `symbol="全部"`
     no longer works; must query per ticker. Serial with AKSHARE_SLEEP;
-    5500 × 1.5s ≈ 2.3h — only runs in the weekly slow workflow."""
+    5500 × 1.5s ≈ 2.3h — only runs in the weekly slow workflow.
+
+    Empty-result semantics: individual tickers legitimately have no
+    research reports (small caps, BJ-listed), so per-ticker None is
+    normal. But if EVERY ticker returns empty across 5500 calls, the
+    upstream API contract is broken (prior Eastmoney schema change
+    that lost the `infoCode` field is the canonical example) — raise
+    so `run_once` records an error AND increments fail_streak, so
+    healthcheck opens an issue after 3 such failures instead of
+    sitting on rows=0 forever looking healthy-ish.
+    """
     sec = _ak_call(ak.stock_info_a_code_name)
     codes = sec["code"].astype(str).tolist()
 
@@ -661,7 +687,10 @@ def fetch_research() -> dict:
 
     df = _per_ticker_serial(codes, one, label="research")
     if df.empty:
-        return {"rows": 0, "note": "no research reports for any ticker"}
+        raise RuntimeError(
+            f"research returned zero rows across {len(codes)} tickers — "
+            "upstream schema break likely (AKShare / Eastmoney contract change)"
+        )
     today = _today_cn().isoformat()
     _write_parquet(df, "research/latest.parquet")
     kb = _write_parquet(df, f"research/history/{today}.parquet")

@@ -37,6 +37,24 @@ CADENCE_H = {
     "research": 24 * 7,
 }
 
+# Row-count floor per endpoint — catches "silently empty" cases that
+# have fresh last_success but near-zero rows (upstream schema break
+# returning empty DFs without raising, or a partial fetch the row
+# guards in fetch_all didn't catch). Keys match the `rows` key in
+# _status.json.endpoints[X].last_meta. None = no floor.
+MIN_ROWS = {
+    "securities": 4500,       # A-share market should be >5000
+    "market_daily": 4000,     # daily bars; 16:30 run has all publishers
+    "macro": 100,             # 4 series × historical depth
+    "north_flow": 100,        # northbound holdings — always a few hundred
+    "research": 50,           # per-ticker reports; 0 = schema break
+    "financials": 50000,      # 5500 tickers × ~12 indicators each
+    "concepts": 50,           # board count floor
+    "industries": 50,
+    "shareholders": 100,
+    # news/lhb/yjyg/margin legitimately have empty days — no floor
+}
+
 
 def main() -> int:
     if not STATUS.exists():
@@ -87,6 +105,18 @@ def main() -> int:
                 f"- `{name}`: stale {age_h:.0f}h (> {threshold_h}h threshold, cadence {cadence_h}h)"
             )
             continue
+
+        # Row-count floor — catches "fresh timestamp but empty/near-empty
+        # rows" silent failure where upstream schema breaks returned DFs
+        # with no data. Rows live under last_meta.rows.
+        floor = MIN_ROWS.get(name)
+        if floor is not None:
+            rows = (ep.get("last_meta") or {}).get("rows")
+            if rows is not None and rows < floor:
+                issues.append(
+                    f"- `{name}`: rows={rows} < floor={floor} (upstream schema change?)"
+                )
+                continue
 
         ok_count += 1
 
