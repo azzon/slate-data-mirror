@@ -128,9 +128,17 @@ def main() -> int:
         # Row-count floor — catches "fresh timestamp but empty/near-empty
         # rows" silent failure where upstream schema breaks returned DFs
         # with no data. Rows live under last_meta.rows.
+        #
+        # Exempt no_work passes: a market_daily gap-heal that finds
+        # nothing pending legitimately returns rows=0. Those set
+        # last_meta.no_work=True. Don't alert on legitimate no-ops.
+        last_meta = ep.get("last_meta") or {}
+        if last_meta.get("no_work"):
+            ok_count += 1
+            continue
         floor = MIN_ROWS.get(name)
         if floor is not None:
-            rows = (ep.get("last_meta") or {}).get("rows")
+            rows = last_meta.get("rows")
             if rows is not None and rows < floor:
                 issues.append(
                     f"- `{name}`: rows={rows} < floor={floor} (upstream schema change?)"

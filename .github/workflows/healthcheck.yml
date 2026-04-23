@@ -39,13 +39,24 @@ jobs:
           else
             echo "has_alert=no" >> "$GITHUB_OUTPUT"
           fi
+      - name: Ensure mirror-health label exists
+        if: steps.analyze.outputs.has_alert == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Idempotent — `--force` overwrites if the label exists.
+          gh label create mirror-health \
+              --color B60205 \
+              --description "Automated alerts from scripts/healthcheck.py" \
+              --force
+
       - name: Open / update tracking issue
         if: steps.analyze.outputs.has_alert == 'yes'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Reuse an existing "mirror-health" issue if present; else create.
-          existing=$(gh issue list --label mirror-health --state open --json number --jq '.[0].number')
+          existing=$(gh issue list --label mirror-health --state open --json number --jq '.[0].number // empty')
           body=$(cat /tmp/hc.out)
           if [ -n "$existing" ]; then
               gh issue comment "$existing" --body "$body"

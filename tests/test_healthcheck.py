@@ -218,3 +218,20 @@ def test_fresh_last_pass_no_alert(tmp_path, monkeypatch, capsys):
     healthcheck.main()
     out = capsys.readouterr().out
     assert not out.startswith("ALERT")
+
+
+def test_no_work_passes_exempt_from_row_floor(tmp_path, monkeypatch, capsys):
+    """market_daily gap-heal legitimately returns rows=0 with
+    no_work=True — must NOT trigger the rows-floor alert."""
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    eps = {
+        "market_daily": {
+            "last_success": fresh, "fail_streak": 0,
+            "last_meta": {"rows": 0, "no_work": True},
+        },
+    }
+    _patch_status(tmp_path, monkeypatch, {"endpoints": eps, "last_pass": {"at": fresh}})
+    import healthcheck
+    healthcheck.main()
+    out = capsys.readouterr().out
+    assert not out.startswith("ALERT")
