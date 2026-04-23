@@ -48,15 +48,15 @@
       "last_attempt": "2026-04-23T15:11:39.445557+00:00"
     },
     "north_flow": {
-      "last_success": "2026-04-23T13:11:55.963478+00:00",
-      "last_elapsed_s": 2.8,
+      "last_success": "2026-04-23T15:23:54.150706+00:00",
+      "last_elapsed_s": 2.4,
       "last_meta": {
         "rows": 2767,
         "size_kb": 198
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-04-23T13:11:55.963478+00:00"
+      "last_attempt": "2026-04-23T15:23:54.150706+00:00"
     },
     "lhb": {
       "last_success": "2026-04-23T13:11:57.930706+00:00",
@@ -143,5 +143,5 @@
     "skipped": 0,
     "elapsed_s": 10.3
   },
-  "updated_at": "2026-04-23T15:23:51.027671+00:00"
+  "updated_at": "2026-04-23T15:23:54.153037+00:00"
 }
