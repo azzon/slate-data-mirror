@@ -28,13 +28,15 @@ install -d -m 755 /etc/systemd/system/"$RUNNER_SVC".d
 # frames) lands near 1.3G so give 1.5G hard cap + 1.3G soft throttle.
 # Previous 1200M was too tight — pip install tripped it silently.
 cat > /etc/systemd/system/"$RUNNER_SVC".d/10-harden.conf <<'EOF'
+[Unit]
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
 [Service]
 MemoryMax=1500M
 MemoryHigh=1300M
 Restart=always
 RestartSec=10
-StartLimitBurst=10
-StartLimitIntervalSec=300
 EOF
 
 echo "==> sshd dual-port (reassert in case ECS reboot wiped it)"
