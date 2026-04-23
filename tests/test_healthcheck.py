@@ -235,3 +235,20 @@ def test_no_work_passes_exempt_from_row_floor(tmp_path, monkeypatch, capsys):
     healthcheck.main()
     out = capsys.readouterr().out
     assert not out.startswith("ALERT")
+
+
+def test_empty_filled_dates_also_exempt(tmp_path, monkeypatch, capsys):
+    """Older mirror code returned filled_dates=[] without setting
+    no_work=True. That's also a legitimate no-op — exempt."""
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    eps = {
+        "market_daily": {
+            "last_success": fresh, "fail_streak": 0,
+            "last_meta": {"rows": 0, "filled_dates": [], "pending_dates": ["2025-01-01"]},
+        },
+    }
+    _patch_status(tmp_path, monkeypatch, {"endpoints": eps, "last_pass": {"at": fresh}})
+    import healthcheck
+    healthcheck.main()
+    out = capsys.readouterr().out
+    assert not out.startswith("ALERT")

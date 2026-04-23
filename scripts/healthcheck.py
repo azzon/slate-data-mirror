@@ -129,11 +129,19 @@ def main() -> int:
         # rows" silent failure where upstream schema breaks returned DFs
         # with no data. Rows live under last_meta.rows.
         #
-        # Exempt no_work passes: a market_daily gap-heal that finds
-        # nothing pending legitimately returns rows=0. Those set
-        # last_meta.no_work=True. Don't alert on legitimate no-ops.
+        # Exempt legitimate no-op passes:
+        #   * no_work=True         → explicit "nothing was due" signal
+        #   * filled_dates == []   → gap-heal loop found no pending dates
+        # Both mean "fetcher ran but had nothing to do" — rows=0 is correct.
         last_meta = ep.get("last_meta") or {}
-        if last_meta.get("no_work"):
+        is_no_op = (
+            last_meta.get("no_work") is True
+            or (
+                "filled_dates" in last_meta
+                and not last_meta["filled_dates"]
+            )
+        )
+        if is_no_op:
             ok_count += 1
             continue
         floor = MIN_ROWS.get(name)
