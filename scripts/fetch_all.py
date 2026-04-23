@@ -877,41 +877,64 @@ def fetch_news() -> dict:
 
 
 def fetch_filings() -> dict:
-    """Mirror the cninfo 全A announcement list for the last 7 days.
+    """Mirror cninfo 全A announcement metadata, rolling 30-day window.
 
-    Why: slate's consumer side on Intel corp proxy cannot reach cninfo
-    (proxy PolicyID:21 blocks Finance and Banking). The mirror runner,
-    being in mainland China with direct access, pages through cninfo's
-    hisAnnouncement/query and persists metadata as parquet. Slate
-    imports the parquet, then downloads individual PDFs via the
-    existing codetabs CORS fallback — which cninfo PDF hosts allow
-    because codetabs is a generic CDN, not categorised finance.
+    Design evolution:
+      W8k: single multi-day call (broken — cninfo truncates to today).
+      W8o: 7-day loop, each call single-day (works, but 7d too narrow:
+           runner outage >7d = permanent data gap).
+      W11: 30-day rolling + per-day cache + peak-avoid:
+        * Past days' parquets act as cache — announcements are
+          immutable so re-fetching burns cninfo quota for zero value.
+        * Today + yesterday always refreshed (more filings arrive
+          throughout the day, late 公告 may cross UTC midnight).
+        * Skip fetch 15:00-17:00 CST (cninfo publication flood,
+          akshare gets 5xx during this window).
+        * Net steady-state cost: 2 API calls/cron (today+yesterday).
+        * Cold-start: 30 calls × 5s ≈ 2.5min, one-time.
 
-    Output shape: one row per announcement with
-        code / name / title / announcement_time / announcement_id / org_id
-    Stored under ``filings/YYYY-MM-DD.parquet`` so slate can pull only
-    the latest day incrementally.
-
-    Implementation note: we call AKShare's
-    ``stock_zh_a_disclosure_report_cninfo`` with ``market='沪深京'`` and
-    no symbol/category filter — it paginates internally (30/page) and
-    returns the full day's set. An empty response (holiday, or cninfo
-    briefly 5xx'd) is a valid no_work result.
+    Slate consumer reads every history/*.parquet so growing the
+    window costs nothing downstream.
     """
-    # cninfo's hisAnnouncement/query silently collapses multi-day queries
-    # to a single day (audit 2026-04-23: start=today-7 end=today returned
-    # only today's 44850 rows / 3000 unique announcements). Workaround:
-    # iterate day-by-day so each call has a single-day window akshare can
-    # actually return. 7 days × 3000/day ≈ 21k unique filings covering the
-    # full A-share universe instead of 124 tickers that filed today.
+    now_cn = datetime.now(CST)
+    # 15:00-17:00 CST = cninfo publication flood. AKShare hits the
+    # same endpoint so we get hangs; skip and come back next slot.
+    if 15 <= now_cn.hour < 17:
+        return {
+            "rows": 0,
+            "note": f"skipped: within cninfo peak window (hour={now_cn.hour} CST)",
+            "no_work": True,
+        }
+
     today = _today_cn()
     frames: list[pd.DataFrame] = []
-    window_days = 7
+    window_days = 30
     per_day_ok = 0
     per_day_err = 0
+    per_day_skip_cached = 0
+    history_dir = DATA_DIR / "filings" / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+
     for offset in range(window_days):
         d = today - timedelta(days=offset)
         ds = d.strftime("%Y%m%d")
+        ds_iso = d.isoformat()
+        day_parquet = history_dir / f"{ds_iso}.parquet"
+
+        # Cache policy:
+        # - offset == 0 (today): always re-fetch
+        # - offset == 1 (yesterday): always re-fetch (UTC-boundary 公告)
+        # - offset >= 2: skip if history parquet already exists
+        if offset >= 2 and day_parquet.exists():
+            try:
+                df_cached = pd.read_parquet(day_parquet)
+                if not df_cached.empty:
+                    frames.append(df_cached)
+                    per_day_skip_cached += 1
+                    continue
+            except Exception as e:
+                log.warning("  filings %s cached parquet unreadable: %s", ds, e)
+
         try:
             df_day = _retry(
                 lambda ds=ds: ak.stock_zh_a_disclosure_report_cninfo(
@@ -930,6 +953,13 @@ def fetch_filings() -> dict:
             continue
         if df_day is None or df_day.empty:
             continue
+        # Per-day dedup before writing (cninfo pagination overlaps).
+        url_col = "公告链接" if "公告链接" in df_day.columns else "announcement_url"
+        if url_col in df_day.columns:
+            df_day = df_day.drop_duplicates(subset=[url_col], keep="first")
+        df_day = df_day.copy()
+        df_day["mirror_fetch_date"] = today.isoformat()
+        df_day.to_parquet(day_parquet, compression="zstd", index=False)
         frames.append(df_day)
         per_day_ok += 1
 
@@ -938,7 +968,7 @@ def fetch_filings() -> dict:
             "rows": 0,
             "note": (
                 f"no filings in {window_days}-day window "
-                f"(errors={per_day_err})"
+                f"(errors={per_day_err}, cached={per_day_skip_cached})"
             ),
         }
     df = pd.concat(frames, ignore_index=True)
@@ -968,10 +998,12 @@ def fetch_filings() -> dict:
     if before != after:
         log.info("  filings dedup: %d → %d rows (%d duplicates dropped)",
                  before, after, before - after)
-    # Stamp mirror-fetch date so slate can age/gap-detect.
-    df["mirror_fetch_date"] = today.isoformat()
-    _write_parquet(df, "filings/latest.parquet")
-    kb = _write_parquet(df, f"filings/history/{today.isoformat()}.parquet")
+    # latest.parquet = union view across the 30-day window. Per-day
+    # files already written inside the loop; no duplicate history
+    # write here (was collapsing announcement-date detail pre-W11).
+    if "mirror_fetch_date" not in df.columns:
+        df["mirror_fetch_date"] = today.isoformat()
+    kb = _write_parquet(df, "filings/latest.parquet")
     return {
         "rows": len(df),
         "size_kb": kb,
@@ -979,6 +1011,7 @@ def fetch_filings() -> dict:
         "dup_dropped": before - after,
         "days_ok": per_day_ok,
         "days_err": per_day_err,
+        "days_skip_cached": per_day_skip_cached,
     }
 
 
