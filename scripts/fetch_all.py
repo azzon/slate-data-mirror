@@ -144,44 +144,54 @@ def _save_market_daily_permafail(dates: set[str]) -> None:
 # ── per-endpoint fetchers ───────────────────────────────────────────────
 
 
-SECURITIES_FLOOR = 4500  # A-share market has ~5500; <4500 means a prefix range failed
+SECURITIES_FLOOR = 4500  # A-share market has ~5500 (SH+SZ+BJ); <4500 = broken
 
 
 def fetch_securities() -> dict:
-    """Securities master list.
+    """Securities master list — the A-share universe reference.
 
-    Prefer Tencent universe probe (same source that seeds market_daily so
-    we never get (ticker, trade_date) rows for a ticker missing from
-    securities). Falls back to akshare if Tencent is down.
+    Prefer AKShare `stock_info_a_code_name` because it includes BJ
+    (Beijing Stock Exchange, ~308 tickers with prefix 4/8/92) which
+    Tencent's gtimg universe probe does NOT cover. Tencent is a fallback
+    only if AKShare is unreachable — accept missing BJ in that degraded
+    case but log it.
 
-    Refuses to overwrite the existing file with a partial (< SECURITIES_FLOOR)
-    result — a Tencent prefix-batch failure shouldn't clobber a healthy
-    reference table.
+    Refuses to overwrite the existing parquet with < SECURITIES_FLOOR
+    rows to prevent a single-source flake from wiping a healthy file.
     """
     chosen_df: pd.DataFrame | None = None
     source = None
+
+    # Primary: AKShare (covers BJ)
     try:
-        universe = tm.fetch_universe()
-        if universe and len(universe) >= SECURITIES_FLOOR:
-            chosen_df = pd.DataFrame([
-                {"code": u["ticker"].split(".")[0], "name": u["name"]}
-                for u in universe
-            ])
-            source = "tencent"
-        elif universe:
-            log.warning("  tencent universe only %d rows (< %d floor) — falling back",
-                        len(universe), SECURITIES_FLOOR)
+        df = _ak_call(ak.stock_info_a_code_name)
+        if df is not None and len(df) >= SECURITIES_FLOOR:
+            chosen_df = df[["code", "name"]].copy()
+            source = "akshare"
+        elif df is not None:
+            log.warning("  akshare universe only %d rows (< %d) — trying Tencent",
+                        len(df), SECURITIES_FLOOR)
     except Exception as e:  # noqa: BLE001
-        log.warning("  tencent universe failed (%s) — falling back to akshare", e)
+        log.warning("  akshare universe failed (%s) — trying Tencent", e)
+
+    # Fallback: Tencent (no BJ — degraded)
+    if chosen_df is None:
+        try:
+            universe = tm.fetch_universe()
+            if universe and len(universe) >= SECURITIES_FLOOR:
+                chosen_df = pd.DataFrame([
+                    {"code": u["ticker"].split(".")[0], "name": u["name"]}
+                    for u in universe
+                ])
+                source = "tencent_fallback_no_bj"
+                log.warning("  using Tencent fallback — BJ tickers will be missing")
+        except Exception as e:  # noqa: BLE001
+            log.warning("  tencent universe also failed (%s)", e)
 
     if chosen_df is None:
-        df = _ak_call(ak.stock_info_a_code_name)
-        if df is None or len(df) < SECURITIES_FLOOR:
-            raise RuntimeError(
-                f"both sources returned < {SECURITIES_FLOOR} rows — refusing to clobber"
-            )
-        chosen_df = df
-        source = "akshare"
+        raise RuntimeError(
+            f"both sources returned < {SECURITIES_FLOOR} rows — refusing to clobber"
+        )
 
     kb = _write_parquet(chosen_df, "securities/latest.parquet")
     return {"rows": len(chosen_df), "size_kb": kb, "source": source}
