@@ -13,9 +13,19 @@ cron day. The retry cron picks whichever chunk has the stalest anchor
 endpoint (>6 days since last success). Running one chunk per trigger
 keeps each workflow job under 4h (was 7h serial).
 
-  Sun primary:  financials + shareholders     (anchor: financials)
-  Wed primary:  research                      (anchor: research)
-  Fri primary:  concepts + industries         (anchor: concepts)
+  Daily primary: financials chunk i=day%7       (anchor: financials)
+  Wed primary:   research                       (anchor: research)
+  Fri primary:   concepts + industries          (anchor: concepts)
+  Sat primary:   shareholders                   (anchor: shareholders)
+
+Wave 10: financials moved from weekly to daily (chunked 1/7 universe
+per day) after the 3h weekly run kept timing out on the 2-core / 2G
+ECS runner. Each chunk is ~20min, well within the 4h workflow cap.
+
+The retry cron inspects each anchor's staleness and re-runs the most
+stale chunk. financials anchor is now 1d stale-threshold (not 6d)
+so a missed day gets picked up the next morning instead of waiting
+until the following week.
 """
 from __future__ import annotations
 
@@ -26,11 +36,14 @@ from pathlib import Path
 
 STATUS = Path("data/_status.json")
 
-# anchor_endpoint → (endpoints_to_run, human_label)
+# anchor_endpoint → (endpoints_to_run, human_label, stale_threshold_days).
+# Daily anchors use a 1-day stale threshold; weekly anchors use 6 days
+# (allowing a primary cron to have fired plus one day of slack).
 CHUNKS = [
-    ("financials",   "financials,shareholders", "fin+shareholders"),
-    ("research",     "research",                "research"),
-    ("concepts",     "concepts,industries",     "concepts+industries"),
+    ("financials",   "financials",            "financials",          1.1),
+    ("research",     "research",              "research",            6.0),
+    ("concepts",     "concepts,industries",   "concepts+industries", 6.0),
+    ("shareholders", "shareholders",          "shareholders",        6.0),
 ]
 
 
@@ -55,8 +68,10 @@ def main() -> int:
     eps = s.get("endpoints", {})
     now = datetime.now(timezone.utc)
     # Find stalest chunk (by anchor-endpoint last_success age).
+    # Compare each chunk's age to its OWN stale threshold (days):
+    # daily anchors trigger at 1d stale, weekly anchors at 6d.
     stalest: tuple[float, str, str] | None = None  # (age_d, endpoints, label)
-    for anchor, endpoints, label in CHUNKS:
+    for anchor, endpoints, label, threshold_d in CHUNKS:
         ep = eps.get(anchor, {})
         t = ep.get("last_success")
         if not t:
@@ -66,7 +81,7 @@ def main() -> int:
                 age_d = (now - datetime.fromisoformat(t)).total_seconds() / 86400
             except ValueError:
                 age_d = 999.0
-        if age_d > 6 and (stalest is None or age_d > stalest[0]):
+        if age_d > threshold_d and (stalest is None or age_d > stalest[0]):
             stalest = (age_d, endpoints, label)
 
     if stalest is None:

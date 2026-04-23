@@ -451,51 +451,131 @@ def fetch_market_daily() -> dict:
     }
 
 
-def _per_ticker_serial(codes: list[str], fetch_one: Callable[[str], pd.DataFrame | None], *, label: str) -> pd.DataFrame:
+def _per_ticker_serial(
+    codes: list[str],
+    fetch_one: Callable[[str], pd.DataFrame | None],
+    *,
+    label: str,
+    flush_every: int = 500,
+) -> pd.DataFrame:
     """Single-threaded per-ticker loop with AKSHARE_SLEEP throttle.
 
-    Strict serial: fewer requests per unit time *is* the point after
-    the Eastmoney IP ban of 2026-04 taught us that. 5500 × 1.5s ≈ 2.3h.
-    Records failures with exception class at DEBUG level so a post-run
-    investigation can tell what failed.
+    Memory discipline for 2G ECS runners: we accumulate at most
+    ``flush_every`` tickers' DataFrames in RAM, then concat them to a
+    single DataFrame and append to an on-disk parquet shard. Final
+    concat reads the shards back in one pass. Without this, a 5500-
+    ticker financials pass held 5500 small DataFrames plus the final
+    concat doubled memory on the same line — pushed the 2G ECS into
+    swap / OOM kill territory.
+
+    Strict serial throttle: fewer requests per unit time *is* the
+    point after the Eastmoney IP ban of 2026-04 taught us that.
+    5500 × 1.5s ≈ 2.3h. Records failures with exception class at
+    DEBUG level so a post-run investigation can tell what failed.
     """
-    rows: list[pd.DataFrame] = []
+    import tempfile
+    shard_dir = Path(tempfile.mkdtemp(prefix=f"mirror-{label}-", dir="/tmp"))
+    shards: list[Path] = []
+    pending: list[pd.DataFrame] = []
     failed_samples: list[str] = []
     failed = 0
-    for i, code in enumerate(codes, 1):
-        try:
-            out = fetch_one(code)
-            if out is not None and not out.empty:
-                rows.append(out)
-            elif out is None or out.empty:
-                # not an exception, just no data for this ticker
+
+    def _flush() -> None:
+        if not pending:
+            return
+        df = pd.concat(pending, ignore_index=True)
+        shard_path = shard_dir / f"{len(shards):04d}.parquet"
+        df.to_parquet(shard_path, compression="zstd", index=False)
+        shards.append(shard_path)
+        pending.clear()
+
+    try:
+        for i, code in enumerate(codes, 1):
+            try:
+                out = fetch_one(code)
+                if out is not None and not out.empty:
+                    pending.append(out)
+                elif out is None or out.empty:
+                    # not an exception, just no data for this ticker
+                    pass
+            except Exception as e:  # noqa: BLE001
+                failed += 1
+                if len(failed_samples) < 10:
+                    failed_samples.append(f"{code}:{type(e).__name__}")
+                log.debug("  %s failed %s: %s", label, code, e)
+            if i % 200 == 0:
+                log.info(
+                    "  %s %d/%d (%d failed, %d shards, %d pending, samples=%s)",
+                    label, i, len(codes), failed, len(shards),
+                    len(pending), failed_samples[:3],
+                )
+            if i % flush_every == 0:
+                _flush()
+        # Flush any leftover
+        _flush()
+        if failed:
+            log.warning("  %s total failures: %d (first 10: %s)",
+                        label, failed, failed_samples)
+        if not shards:
+            return pd.DataFrame()
+        # Read shards back for final concat. At this point pending is
+        # empty and peak memory = one shard at a time during parquet
+        # read + the growing result DF. Much lower than holding all
+        # 5500 DataFrames in `rows`.
+        return pd.concat(
+            [pd.read_parquet(p) for p in shards],
+            ignore_index=True,
+        )
+    finally:
+        # Clean up shards (result is fully in memory by now).
+        for p in shards:
+            try:
+                p.unlink()
+            except OSError:
                 pass
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            if len(failed_samples) < 10:
-                failed_samples.append(f"{code}:{type(e).__name__}")
-            log.debug("  %s failed %s: %s", label, code, e)
-        if i % 200 == 0:
-            log.info("  %s %d/%d (%d failed, samples=%s)",
-                     label, i, len(codes), failed, failed_samples[:3])
-    if failed:
-        log.warning("  %s total failures: %d (first 10: %s)",
-                    label, failed, failed_samples)
-    if not rows:
-        return pd.DataFrame()
-    return pd.concat(rows, ignore_index=True)
+        try:
+            shard_dir.rmdir()
+        except OSError:
+            pass
 
 
 def fetch_financials() -> dict:
-    """Per-ticker full-history financial abstract.
+    """Per-ticker full-history financial abstract — chunked over 7 days.
 
-    Runs weekly. Strictly serial with AKSHARE_SLEEP between calls —
-    5500 tickers × 1.5s ≈ 2.3 hours. The speed hit is worth it: any
-    ban on this endpoint blocks financials for a week, and the data
-    changes quarterly, so we never need speed.
+    Why chunked: a full 5500-ticker pass takes 2.5-3 hours on the
+    2-core ECS runner and pushes memory close to the 2G cap. Worse,
+    the GitHub Actions 4h timeout occasionally kills the job right
+    before the final parquet write, so a whole week's refresh cycle
+    is lost. And workers_serial (1 req / 1.5s) means a single flaky
+    AKShare hour (e.g. 100 consecutive ticker timeouts × 30s = 50min
+    lost) can push a run past 4h.
+
+    New design — deterministic 7-day rotation:
+    - Day-of-year modulo 7 picks the chunk. Chunk i = every 7th
+      ticker starting at offset i when the universe is sorted.
+    - Each day's chunk ≈ 5500/7 ≈ 785 tickers → ~20 min wall-clock,
+      ~300 MB peak memory.
+    - After 7 days every ticker has been refreshed once; quarterly
+      data changes don't require faster.
+    - On-disk accumulator: previous chunks' parquets stay in
+      ``financials/chunks/<i>.parquet`` and latest.parquet is
+      assembled from all 7 on write.
+
+    The ``latest.parquet`` that SLATE reads is ALWAYS the union of
+    every chunk — even before 7 days are complete, it has whichever
+    6/7 (or 1/7 on day-one) that have been filled so far. No empty
+    window; coverage grows monotonically.
     """
+    from datetime import datetime
     sec = _ak_call(ak.stock_info_a_code_name)
-    codes = sec["code"].astype(str).tolist()
+    codes = sorted(sec["code"].astype(str).tolist())
+    # Chunk index from the day of year. Modulo 7 (not modulo 30 or
+    # whatever) gives one refresh per week per ticker — matches the
+    # historical cadence of the weekly-slow workflow.
+    chunk_idx = datetime.now(tz=timezone.utc).timetuple().tm_yday % 7
+    chunk = [c for i, c in enumerate(codes) if i % 7 == chunk_idx]
+    log.info("  financials: chunk %d/7 covers %d/%d tickers",
+             chunk_idx, len(chunk), len(codes))
 
     def one(code: str):
         df = _ak_call(ak.stock_financial_abstract, symbol=code)
@@ -505,13 +585,39 @@ def fetch_financials() -> dict:
             return df
         return None
 
-    df = _per_ticker_serial(codes, one, label="financials")
-    if df.empty:
-        raise RuntimeError("financials returned 0 rows")
+    df_chunk = _per_ticker_serial(
+        chunk, one, label=f"financials-c{chunk_idx}",
+    )
+    if df_chunk.empty:
+        raise RuntimeError(f"financials chunk {chunk_idx} returned 0 rows")
+    # Persist chunk — becomes the authoritative source for these
+    # tickers until the next 7-day rotation.
+    _write_parquet(df_chunk, f"financials/chunks/{chunk_idx}.parquet")
+
+    # Rebuild latest.parquet from all available chunks. If some chunks
+    # haven't run yet, that's fine — latest just has fewer tickers,
+    # still monotonic grows over the first week.
+    chunks_dir = REPO_ROOT / "data" / "financials" / "chunks"
+    chunk_dfs: list[pd.DataFrame] = []
+    for p in sorted(chunks_dir.glob("*.parquet")):
+        chunk_dfs.append(pd.read_parquet(p))
+    full = pd.concat(chunk_dfs, ignore_index=True) if chunk_dfs else df_chunk
+    # Defensive dedup — if two chunks accidentally overlap (shouldn't
+    # happen with i%7 indexing but belt & suspenders for rewrites),
+    # keep the latest write per (code, item).
+    dedup_cols = [c for c in ("code", "item") if c in full.columns]
+    if dedup_cols:
+        full = full.drop_duplicates(subset=dedup_cols, keep="last")
+
     today = _today_cn().isoformat()
-    _write_parquet(df, "financials/latest.parquet")
-    kb = _write_parquet(df, f"financials/history/{today}.parquet")
-    return {"rows": len(df), "size_kb": kb}
+    _write_parquet(full, "financials/latest.parquet")
+    kb = _write_parquet(df_chunk, f"financials/history/{today}-c{chunk_idx}.parquet")
+    return {
+        "rows": len(full),
+        "chunk_rows": len(df_chunk),
+        "chunk_idx": chunk_idx,
+        "size_kb": kb,
+    }
 
 
 def fetch_macro() -> dict:
@@ -866,7 +972,9 @@ ENDPOINTS: list[Endpoint] = [
     Endpoint("margin",        cadence_h=20, fetcher=fetch_margin),
     # research is per-ticker 5500× serial ≈ 2.3h — weekly only
     # Weekly (quarterly-paced data + per-ticker loops):
-    Endpoint("financials",    cadence_h=24 * 7, fetcher=fetch_financials, tags=["slow"]),
+    # financials: chunked 1/7 per day — each pass is ~20min for 785 tickers.
+    # cadence_h = 23 so a 24h-cycle cron isn't stopped by last-pass-at-23h58min.
+    Endpoint("financials",    cadence_h=23,    fetcher=fetch_financials, tags=["slow"]),
     Endpoint("shareholders",  cadence_h=24 * 7, fetcher=fetch_shareholders),
     Endpoint("concepts",      cadence_h=24 * 7, fetcher=fetch_concepts,   tags=["slow"]),
     Endpoint("industries",    cadence_h=24 * 7, fetcher=fetch_industries, tags=["slow"]),

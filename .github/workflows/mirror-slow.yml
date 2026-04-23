@@ -16,13 +16,21 @@ name: Mirror slow endpoints (chunked)
 # chunk's anchor endpoint).
 on:
   schedule:
-    # Sun 19:00 UTC = Sun 03:00 CST (financials + shareholders)
-    - cron: "0 19 * * 6"
+    # Daily 19:00 UTC = 03:00 CST — financials chunk i=day_of_year%7
+    # (full universe refreshed weekly, ~20min per run, ≤300MB RAM).
+    # Wave 10: moved from weekly to daily after audit found financials
+    # had never successfully completed the 3h+ weekly pass (timeouts
+    # + 2G OOM on the ECS runner).
+    - cron: "0 19 * * *"
     # Tue 19:00 UTC = Wed 03:00 CST (research)
     - cron: "0 19 * * 2"
     # Thu 19:00 UTC = Fri 03:00 CST (concepts + industries)
     - cron: "0 19 * * 4"
-    # Daily 18:30 UTC = 02:30 CST (retry for missed chunks)
+    # Sat 19:00 UTC = Sun 03:00 CST (shareholders — weekly is fine,
+    # data changes slowly and each pass is ~5min)
+    - cron: "0 19 * * 6"
+    # Daily 18:30 UTC = 02:30 CST (retry for missed chunks — still
+    # useful for research / concepts / industries which are weekly)
     - cron: "30 18 * * *"
   workflow_dispatch:
     inputs:
@@ -97,13 +105,12 @@ jobs:
             echo "reason=manual_force"
             exit 0
           fi
-          # Primary crons — each picks its own chunk
+          # Primary crons — each picks its own chunk.
+          # NOTE: GitHub's cron is evaluated loosely; when two crons fire at
+          # the same wall-clock minute (e.g. "0 19 * * *" and "0 19 * * 6"),
+          # GitHub runs each separately. Order below is specificity-first so
+          # the day-specific crons match before the daily catch-all.
           case "$CRON" in
-            "0 19 * * 6")
-              echo "endpoints=financials,shareholders" >> "$GITHUB_OUTPUT"
-              echo "run=yes" >> "$GITHUB_OUTPUT"
-              echo "reason=sun_primary"
-              ;;
             "0 19 * * 2")
               echo "endpoints=research" >> "$GITHUB_OUTPUT"
               echo "run=yes" >> "$GITHUB_OUTPUT"
@@ -113,6 +120,17 @@ jobs:
               echo "endpoints=concepts,industries" >> "$GITHUB_OUTPUT"
               echo "run=yes" >> "$GITHUB_OUTPUT"
               echo "reason=fri_primary"
+              ;;
+            "0 19 * * 6")
+              echo "endpoints=shareholders" >> "$GITHUB_OUTPUT"
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+              echo "reason=sat_primary"
+              ;;
+            "0 19 * * *")
+              # Daily financials chunk (1/7 of universe per day).
+              echo "endpoints=financials" >> "$GITHUB_OUTPUT"
+              echo "run=yes" >> "$GITHUB_OUTPUT"
+              echo "reason=daily_financials_chunk"
               ;;
             "30 18 * * *")
               # Retry cron — scripts/slow_decide.py emits the stalest chunk.
