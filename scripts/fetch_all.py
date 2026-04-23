@@ -343,8 +343,11 @@ def fetch_market_daily() -> dict:
     """
     today = _today_cn()
     now = datetime.now(CST)
-    MAX_GAP_FILL = int(os.environ.get("MIRROR_MAX_GAP_FILL", "20"))
-    HISTORY_DAYS = int(os.environ.get("MIRROR_HISTORY_DAYS", str(365 * 5 + 1)))
+    # Bounded per-run gap-fill budget. One cron pass shouldn't spend
+    # more than ~20 date-fetches even if many dates are missing; the
+    # next cron will chip away at the remainder. 5y history window.
+    MAX_GAP_FILL = 20
+    HISTORY_DAYS = 365 * 5 + 1
 
     # Adaptive floor: half of the recent median ticker count, or 500 as
     # an absolute minimum on fresh clones where no median exists.
@@ -864,41 +867,6 @@ def _git_push_all() -> bool:
         return True
     except subprocess.CalledProcessError as e:
         log.warning("  git op failed: %s",
-                    (e.stderr or e.stdout or "").strip()[-200:])
-        return False
-
-
-def _git_push_incremental(ep_name: str, meta: dict) -> bool:
-    """DEPRECATED — kept for bootstrap_history compatibility. New code
-    should use _git_commit_local + _git_push_all for batched pushes."""
-    def run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(args, cwd=REPO_ROOT, check=check, text=True, capture_output=True)
-    try:
-        run("git", "add", "data/")
-        if run("git", "diff", "--cached", "--quiet", check=False).returncode == 0:
-            log.info("  (no diff to commit for %s)", ep_name)
-            return True
-        rows = meta.get("rows", meta.get("boards", meta.get("members", "?")))
-        extra = ""
-        if meta.get("filled_dates"):
-            extra = f" [filled: {','.join(meta['filled_dates'][:5])}{'...' if len(meta['filled_dates']) > 5 else ''}]"
-        run("git", "commit", "-m", f"data({ep_name}): {rows} rows{extra}")
-        # Pull-rebase-autostash — accounts for two workflows writing
-        # concurrently, or for a human making a repo-level commit.
-        pull = run("git", "pull", "--rebase", "--autostash", "origin", "main", check=False)
-        if pull.returncode != 0:
-            log.warning("  pull --rebase failed for %s: %s", ep_name,
-                        (pull.stderr or pull.stdout or "").strip()[-200:])
-            return False
-        push = run("git", "push", "origin", "HEAD:main", check=False)
-        if push.returncode != 0:
-            log.warning("  push failed for %s: %s", ep_name,
-                        (push.stderr or push.stdout or "").strip()[-200:])
-            return False
-        log.info("  pushed %s", ep_name)
-        return True
-    except subprocess.CalledProcessError as e:
-        log.warning("  git op failed for %s: %s", ep_name,
                     (e.stderr or e.stdout or "").strip()[-200:])
         return False
 

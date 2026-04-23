@@ -10,9 +10,8 @@ and return 403 before any request reaches the data host. Tencent's
 Shapes mirror the three akshare functions SLATE depends on so callers
 don't have to care which provider served the data:
 
-* ``fetch_universe()``       → ``refresh_securities()``
-* ``fetch_daily_bars(...)``  → ``refresh_daily_bars(...)``
-* ``fetch_market_cap()``     → ``refresh_market_cap_snapshot()``
+* ``fetch_universe()``       — also stamps total_mv_yi into market_daily
+* ``fetch_daily_bars(...)``  — 5-year qfq history per call
 
 Nothing here talks to DuckDB — persistence stays in ``akshare_market``
 so the swap is one-line at the call site.
@@ -389,20 +388,3 @@ def fetch_daily_bars(
     return result
 
 
-def fetch_market_cap() -> dict[str, float]:
-    """Snapshot ``{ticker: total_mv_yuan}`` via the universe probe.
-
-    Reuses ``fetch_universe`` — the qt response already carries total_mv
-    in 亿元, so a one-shot call is 5x cheaper than akshare's 5-minute
-    ``stock_zh_a_spot_em``.
-    """
-    universe = fetch_universe()
-    out: dict[str, float] = {}
-    for row in universe:
-        mv_yi = row.get("total_mv_yi")
-        if mv_yi is None:
-            continue
-        # Store in 元 to match akshare's 总市值 column (which is in 元).
-        out[row["ticker"]] = float(mv_yi) * 1e8
-    logger.info(f"tencent: market_cap snapshot rows={len(out)}")
-    return out
