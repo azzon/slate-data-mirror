@@ -44,14 +44,25 @@ def _keep(d: date, today: date) -> bool:
 
 
 def prune_group(group_dir: Path, today: date) -> int:
-    """Return number of files deleted."""
+    """Return number of files deleted.
+
+    Recognised filename shapes:
+      * ``YYYY-MM-DD.parquet``          — plain daily snapshot
+      * ``YYYY-MM-DD-cN.parquet``       — chunked endpoint (Wave 10
+        financials rotation writes one per chunk, same date multiple
+        files). The leading 10 chars are the date for retention.
+    """
     history = group_dir / "history"
     if not history.exists():
         return 0
     deleted = 0
     for p in history.glob("*.parquet"):
+        # First 10 chars = YYYY-MM-DD; ignore suffix (e.g. "-c3" on
+        # chunked endpoints) so chunk files rotate out on the same
+        # retention schedule as plain dailies.
+        stem_prefix = p.stem[:10]
         try:
-            d = datetime.strptime(p.stem, "%Y-%m-%d").date()
+            d = datetime.strptime(stem_prefix, "%Y-%m-%d").date()
         except ValueError:
             continue
         if not _keep(d, today):
