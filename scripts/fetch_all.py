@@ -747,27 +747,50 @@ def fetch_filings() -> dict:
     returns the full day's set. An empty response (holiday, or cninfo
     briefly 5xx'd) is a valid no_work result.
     """
+    # cninfo's hisAnnouncement/query silently collapses multi-day queries
+    # to a single day (audit 2026-04-23: start=today-7 end=today returned
+    # only today's 44850 rows / 3000 unique announcements). Workaround:
+    # iterate day-by-day so each call has a single-day window akshare can
+    # actually return. 7 days × 3000/day ≈ 21k unique filings covering the
+    # full A-share universe instead of 124 tickers that filed today.
     today = _today_cn()
-    start = (today - timedelta(days=7)).strftime("%Y%m%d")
-    end = today.strftime("%Y%m%d")
-    try:
-        df = _retry(
-            lambda: ak.stock_zh_a_disclosure_report_cninfo(
-                symbol="",                # all tickers
-                market="沪深京",
-                keyword="",
-                category="",
-                start_date=start,
-                end_date=end,
-            ),
-            tries=3,
-        )
-    except Exception as e:  # noqa: BLE001 — cninfo intermittently 5xx's
-        log.warning("  filings fetch failed: %s", e)
-        return {"rows": 0, "note": f"cninfo error: {type(e).__name__}"}
+    frames: list[pd.DataFrame] = []
+    window_days = 7
+    per_day_ok = 0
+    per_day_err = 0
+    for offset in range(window_days):
+        d = today - timedelta(days=offset)
+        ds = d.strftime("%Y%m%d")
+        try:
+            df_day = _retry(
+                lambda ds=ds: ak.stock_zh_a_disclosure_report_cninfo(
+                    symbol="",
+                    market="沪深京",
+                    keyword="",
+                    category="",
+                    start_date=ds,
+                    end_date=ds,
+                ),
+                tries=3,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("  filings %s fetch failed: %s", ds, e)
+            per_day_err += 1
+            continue
+        if df_day is None or df_day.empty:
+            continue
+        frames.append(df_day)
+        per_day_ok += 1
 
-    if df is None or df.empty:
-        return {"rows": 0, "note": "no filings in window"}
+    if not frames:
+        return {
+            "rows": 0,
+            "note": (
+                f"no filings in {window_days}-day window "
+                f"(errors={per_day_err})"
+            ),
+        }
+    df = pd.concat(frames, ignore_index=True)
 
     # Normalise Chinese column names → English (mirror convention: keep
     # one form, documented here). Downstream slate reader handles either
@@ -798,7 +821,14 @@ def fetch_filings() -> dict:
     df["mirror_fetch_date"] = today.isoformat()
     _write_parquet(df, "filings/latest.parquet")
     kb = _write_parquet(df, f"filings/history/{today.isoformat()}.parquet")
-    return {"rows": len(df), "size_kb": kb, "window_days": 7, "dup_dropped": before - after}
+    return {
+        "rows": len(df),
+        "size_kb": kb,
+        "window_days": window_days,
+        "dup_dropped": before - after,
+        "days_ok": per_day_ok,
+        "days_err": per_day_err,
+    }
 
 
 # ── endpoint registry + cadence ─────────────────────────────────────────
