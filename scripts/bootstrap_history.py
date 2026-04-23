@@ -75,26 +75,47 @@ def _chunk_worker(chunk: list[str], start: str, end: str, workers: int,
 
 
 def _fetch_chunk_subprocess(chunk, *, start, end, workers, timeout_s, mp_ctx):
-    """Run a chunk fetch in a child process; kill on timeout."""
+    """Run a chunk fetch in a child process; kill on timeout.
+
+    multiprocessing gotcha: if the child puts a large result on the queue,
+    its background feeder thread may not finish flushing to the OS pipe
+    before the child "finishes" — p.join() can block until the pipe
+    drains. For 50 tickers × ~1200 bars ≈ 6MB pickled, the feeder lag is
+    real on a 1.6 GB box under memory pressure. So: drain the queue
+    FIRST with a long-enough timeout, THEN join the child.
+    """
     q = mp_ctx.Queue()
     p = mp_ctx.Process(target=_chunk_worker,
                        args=(chunk, start, end, workers, q))
     p.start()
-    p.join(timeout=timeout_s)
+
+    # Drain result first — long timeout covers both fetch work + feeder flush.
+    result: tuple | None = None
+    drain_err: str | None = None
+    try:
+        result = q.get(timeout=timeout_s)
+    except Exception as e:  # includes queue.Empty — child never produced
+        drain_err = f"{type(e).__name__}: {e}"
+
+    # Now join; the child has put() and should exit promptly
+    p.join(timeout=30)
     if p.is_alive():
-        # Terminate then kill — we don't trust a hung child to honour
-        # SIGTERM if it's deadlocked on a lock.
+        # Child hanging despite having sent (or not sent) its result
         p.terminate()
         p.join(timeout=5)
         if p.is_alive():
             p.kill()
             p.join(timeout=5)
-        raise _ChunkTimeout()
-    # Drain queue
-    try:
-        status, payload = q.get(timeout=10)
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"no result from child: {e}") from e
+        if result is None:
+            raise _ChunkTimeout()
+
+    if result is None:
+        # Queue.get raised before child terminated — assume true timeout
+        raise _ChunkTimeout() if drain_err and "Empty" in drain_err else RuntimeError(
+            f"child produced no result: {drain_err}"
+        )
+
+    status, payload = result
     if status != "ok":
         raise RuntimeError(f"child failed: {payload}")
     return payload
@@ -121,15 +142,26 @@ def _market_daily_path(d: date) -> Path:
 
 
 def _git_push(msg: str) -> None:
+    """Commit + rebase + push. Matches fetch_all.py::_git_push_incremental.
+    Critical: rebase-autostash before push so a concurrent workflow run
+    (we've seen bootstrap + fast + market interleave through the single
+    runner) doesn't cause silent non-fast-forward failures that then
+    get wiped by the next job's `git clean -ffdx`."""
     def r(*args):
         return subprocess.run(args, cwd=REPO_ROOT, check=False, text=True, capture_output=True)
     r("git", "add", "data/")
     if r("git", "diff", "--cached", "--quiet").returncode == 0:
         return
     r("git", "commit", "-m", msg)
-    p = r("git", "push", "origin", "HEAD:main")
-    if p.returncode != 0:
-        log.warning("  git push failed: %s", (p.stderr or p.stdout or "").strip()[-200:])
+    pull = r("git", "pull", "--rebase", "--autostash", "origin", "main")
+    if pull.returncode != 0:
+        log.warning("  git pull --rebase failed: %s",
+                    (pull.stderr or pull.stdout or "").strip()[-200:])
+        return
+    push = r("git", "push", "origin", "HEAD:main")
+    if push.returncode != 0:
+        log.warning("  git push failed: %s",
+                    (push.stderr or push.stdout or "").strip()[-200:])
 
 
 def bootstrap_market_daily(years: int, workers: int = 8) -> None:

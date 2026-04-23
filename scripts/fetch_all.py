@@ -328,10 +328,25 @@ def fetch_market_daily() -> dict:
 
     pending: list[date] = []
 
-    # Today — only after 16:00 CST to ensure close prices are final
+    # Today — only after 16:00 CST to ensure close prices are final.
+    # If today's file already exists but is below the recent-median floor
+    # (the 16:30 run wrote ~4400 while 5200 tickers eventually publish by
+    # 17:00), re-fetch to merge the late publishers in. Without this,
+    # late-publisher tickers were permanently lost because mere
+    # `exists()` short-circuited the 17:30 straggler run.
     if _is_trading_day(today) and now.hour >= 16:
-        if not _market_daily_path(today).exists():
+        today_path = _market_daily_path(today)
+        if not today_path.exists():
             pending.append(today)
+        elif recent_median:
+            try:
+                n_today = len(pd.read_parquet(today_path))
+                if n_today < int(recent_median * 0.95):
+                    log.info("  today %s has %d rows (< 95%% of median %d) — re-fetching to merge",
+                             today, n_today, recent_median)
+                    pending.append(today)
+            except Exception:  # noqa: BLE001
+                pass
 
     # Full-history gap scan (bounded, with permanent-fail memory)
     permafail = _load_market_daily_permafail()
@@ -845,8 +860,14 @@ def run_once(*, only: list[str] | None, force: bool, incremental_push: bool) -> 
             if incremental_push:
                 pushed = _git_push_incremental(ep.name, meta)
                 if not pushed:
-                    # Roll back last_success so cadence re-tries next run
+                    # Roll back both last_success AND last_attempt so the
+                    # cadence gate treats this as "not attempted" and the
+                    # next workflow run (even the next 4h cron) picks it
+                    # up. Previously only last_success was rolled back,
+                    # but _is_due reads last_attempt — endpoint silently
+                    # waited for the full cadence before retrying.
                     status["endpoints"][ep.name]["last_success"] = prior.get("last_success")
+                    status["endpoints"][ep.name]["last_attempt"] = prior.get("last_attempt")
                     status["endpoints"][ep.name]["last_push_error"] = now_iso
                     _save_status(status)
         except Exception as e:  # noqa: BLE001
