@@ -201,6 +201,49 @@ def test_merge_empty_new_frame_is_noop(tmp_path, monkeypatch):
     assert not fa._market_daily_path(d).exists()
 
 
+def test_git_helpers_noop_when_no_diff(tmp_path, monkeypatch):
+    """_git_commit_local should return True (not raise) when there's
+    nothing staged to commit."""
+    fa = _sandbox(monkeypatch, tmp_path)
+    # Set REPO_ROOT to a fake git repo
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    import subprocess
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
+    # Empty commit so HEAD exists
+    subprocess.run(["git", "commit", "--allow-empty", "-m", "init"],
+                   cwd=str(repo), check=True)
+    monkeypatch.setattr(fa, "REPO_ROOT", repo)
+    (repo / "data").mkdir()
+    assert fa._git_commit_local("test_ep", {"rows": 0}) is True
+
+
+def test_git_commit_local_commits_diff(tmp_path, monkeypatch):
+    """When there IS a data/ diff, commit should be created."""
+    fa = _sandbox(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    import subprocess
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(repo), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(repo), check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-m", "init"], cwd=str(repo), check=True)
+    monkeypatch.setattr(fa, "REPO_ROOT", repo)
+    # Create a tracked data/ diff
+    (repo / "data").mkdir()
+    (repo / "data" / "endpoint.txt").write_text("hello")
+    assert fa._git_commit_local("test_ep", {"rows": 42}) is True
+    # Verify the commit exists
+    log = subprocess.run(
+        ["git", "log", "--oneline", "-1"],
+        cwd=str(repo), capture_output=True, text=True
+    )
+    assert "test_ep" in log.stdout
+    assert "42" in log.stdout
+
+
 def test_merge_all_null_close_skipped(tmp_path, monkeypatch):
     """If the entire new batch has null close, we write nothing and
     return 0 — don't clobber prior."""

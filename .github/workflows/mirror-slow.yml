@@ -56,7 +56,8 @@ jobs:
             git remote set-url origin git@github.com:azzon/slate-data-mirror.git
             git fetch --depth=1 origin main
             git checkout --detach FETCH_HEAD
-            git clean -ffdx
+            git clean -fd -e .venv -e .cache -e __pycache__
+            git gc --auto --quiet || true
           else
             git clone --depth 1 git@github.com:azzon/slate-data-mirror.git .
           fi

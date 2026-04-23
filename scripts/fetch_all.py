@@ -809,15 +809,68 @@ def _is_due(ep: Endpoint, status: dict, *, force: bool) -> bool:
     return age_h >= ep.cadence_h
 
 
-def _git_push_incremental(ep_name: str, meta: dict) -> bool:
-    """Commit + push this endpoint's diff. Returns True on success.
+def _git_commit_local(ep_name: str, meta: dict) -> bool:
+    """Commit this endpoint's diff locally WITHOUT pushing.
 
-    Performs git pull --rebase --autostash before push so a concurrent
-    writer (another workflow or a human commit) doesn't force-fail us
-    with non-fast-forward. On failure the caller should clear the
-    endpoint's last_success so cadence will retry on next run rather
-    than waiting out the normal cycle.
+    Returns True if a commit was created, False if no diff to commit
+    (also True) — False only on actual git command failure. The caller
+    batches all commits and pushes once at the end via _git_push_all().
     """
+    def run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(args, cwd=REPO_ROOT, check=check, text=True, capture_output=True)
+    try:
+        run("git", "add", "data/")
+        if run("git", "diff", "--cached", "--quiet", check=False).returncode == 0:
+            log.info("  (no diff to commit for %s)", ep_name)
+            return True
+        rows = meta.get("rows", meta.get("boards", meta.get("members", "?")))
+        extra = ""
+        if meta.get("filled_dates"):
+            extra = f" [filled: {','.join(meta['filled_dates'][:5])}{'...' if len(meta['filled_dates']) > 5 else ''}]"
+        run("git", "commit", "-m", f"data({ep_name}): {rows} rows{extra}")
+        return True
+    except subprocess.CalledProcessError as e:
+        log.warning("  git commit failed for %s: %s", ep_name,
+                    (e.stderr or e.stdout or "").strip()[-200:])
+        return False
+
+
+def _git_push_all() -> bool:
+    """Batched push of every local commit from this pass.
+
+    Pulls --rebase --autostash first so a concurrent writer (another
+    workflow or human commit) doesn't force-fail us. Returns True on
+    success, False otherwise.
+    """
+    def run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(args, cwd=REPO_ROOT, check=check, text=True, capture_output=True)
+    try:
+        # Nothing to push? Skip fast.
+        ahead = run("git", "rev-list", "--count", "@{upstream}..HEAD", check=False)
+        if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+            log.info("  (no commits to push)")
+            return True
+        pull = run("git", "pull", "--rebase", "--autostash", "origin", "main", check=False)
+        if pull.returncode != 0:
+            log.warning("  pull --rebase failed: %s",
+                        (pull.stderr or pull.stdout or "").strip()[-200:])
+            return False
+        push = run("git", "push", "origin", "HEAD:main", check=False)
+        if push.returncode != 0:
+            log.warning("  push failed: %s",
+                        (push.stderr or push.stdout or "").strip()[-200:])
+            return False
+        log.info("  batched push successful")
+        return True
+    except subprocess.CalledProcessError as e:
+        log.warning("  git op failed: %s",
+                    (e.stderr or e.stdout or "").strip()[-200:])
+        return False
+
+
+def _git_push_incremental(ep_name: str, meta: dict) -> bool:
+    """DEPRECATED — kept for bootstrap_history compatibility. New code
+    should use _git_commit_local + _git_push_all for batched pushes."""
     def run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(args, cwd=REPO_ROOT, check=check, text=True, capture_output=True)
     try:
@@ -851,9 +904,23 @@ def _git_push_incremental(ep_name: str, meta: dict) -> bool:
 
 
 def run_once(*, only: list[str] | None, force: bool, incremental_push: bool) -> int:
+    """Run every due endpoint once.
+
+    Commits: one commit per endpoint locally (preserves per-endpoint
+    log granularity), but a SINGLE push at the end that carries all
+    of them together. This cuts the repo's growth rate by ~6× vs the
+    previous per-endpoint-push pattern — every fast cron used to mint
+    8 separate commits × 5 runs/day = 40 network round-trips; now
+    it's 5 pushes/day with 8 commits each. Same data granularity, far
+    less repo bloat (each push is a single ref update).
+
+    If a commit/push step fails, the pass continues and the final
+    push step tries again at the end with all accumulated commits.
+    """
     status = _load_status()
     started = time.time()
     succeeded = failed = skipped = 0
+    committed_endpoints: list[str] = []
 
     for ep in ENDPOINTS:
         if only and ep.name not in only:
@@ -868,17 +935,8 @@ def run_once(*, only: list[str] | None, force: bool, incremental_push: bool) -> 
         try:
             meta = ep.fetcher()
             elapsed = time.time() - ep_started
-            # Health semantics:
-            #  last_attempt  — always updated (cadence gate reads this)
-            #  last_success  — only updated when meta actually produced data
-            #  fail_streak   — incremented on no-data attempts too, so a
-            #                  gate-blocked market_daily (pre-close 16:00)
-            #                  doesn't look "healthy" forever.
             now_iso = datetime.now(timezone.utc).isoformat()
             produced_data = meta.get("rows", 0) > 0 or bool(meta.get("filled_dates"))
-            # Some endpoints legitimately have no-work passes (gap-heal when
-            # everything is already present) — mark them with no_work=True
-            # in their return meta to opt out of fail_streak.
             no_work = bool(meta.get("no_work"))
             new_streak = 0 if produced_data or no_work else prior.get("fail_streak", 0) + 1
             status["endpoints"][ep.name] = {
@@ -896,18 +954,9 @@ def run_once(*, only: list[str] | None, force: bool, incremental_push: bool) -> 
                      ep.name, elapsed, meta.get("rows", "?"), new_streak)
             _save_status(status)
             if incremental_push:
-                pushed = _git_push_incremental(ep.name, meta)
-                if not pushed:
-                    # Roll back both last_success AND last_attempt so the
-                    # cadence gate treats this as "not attempted" and the
-                    # next workflow run (even the next 4h cron) picks it
-                    # up. Previously only last_success was rolled back,
-                    # but _is_due reads last_attempt — endpoint silently
-                    # waited for the full cadence before retrying.
-                    status["endpoints"][ep.name]["last_success"] = prior.get("last_success")
-                    status["endpoints"][ep.name]["last_attempt"] = prior.get("last_attempt")
-                    status["endpoints"][ep.name]["last_push_error"] = now_iso
-                    _save_status(status)
+                # Commit locally (no push yet) — batched push at the end.
+                if _git_commit_local(ep.name, meta):
+                    committed_endpoints.append(ep.name)
         except Exception as e:  # noqa: BLE001
             failed += 1
             status["endpoints"][ep.name] = {
@@ -929,8 +978,22 @@ def run_once(*, only: list[str] | None, force: bool, incremental_push: bool) -> 
         "elapsed_s": round(time.time() - started, 1),
     }
     _save_status(status)
+    # Final batched push — collects all endpoint commits + the status
+    # update into one network round-trip.
     if incremental_push:
-        _git_push_incremental("_status", {"rows": "status"})
+        _git_commit_local("_status", {"rows": "status"})
+        pushed = _git_push_all()
+        if not pushed:
+            # Push failed — roll back last_attempt for every endpoint
+            # we claimed success for, so cadence retries them next run.
+            for ep_name in committed_endpoints:
+                ep_status = status["endpoints"].get(ep_name, {})
+                ep_status["last_attempt"] = (
+                    ep_status.get("_prior_last_attempt")
+                    or ep_status.get("last_attempt")
+                )
+                ep_status["last_push_error"] = datetime.now(timezone.utc).isoformat()
+            _save_status(status)
     log.info("pass done: %d ok, %d fail, %d skip, %.1fs",
              succeeded, failed, skipped, time.time() - started)
     return 0 if succeeded > 0 or (succeeded + failed) == 0 else 1
