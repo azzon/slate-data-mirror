@@ -451,6 +451,25 @@ def fetch_market_daily() -> dict:
     }
 
 
+# Memory-watermark: trigger an early flush when free memory falls
+# below this much (bytes). 200 MB headroom on the 2 GB ECS gives
+# pandas enough room to do the final concat without OOM.
+_LOW_MEM_THRESHOLD_BYTES = 200 * 1024 * 1024
+
+
+def _available_memory_bytes() -> int | None:
+    """Read MemAvailable from /proc/meminfo. Returns None on non-Linux."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    kb = int(line.split()[1])
+                    return kb * 1024
+    except OSError:
+        return None
+    return None
+
+
 def _per_ticker_serial(
     codes: list[str],
     fetch_one: Callable[[str], pd.DataFrame | None],
@@ -460,25 +479,32 @@ def _per_ticker_serial(
 ) -> pd.DataFrame:
     """Single-threaded per-ticker loop with AKSHARE_SLEEP throttle.
 
-    Memory discipline for 2G ECS runners: we accumulate at most
-    ``flush_every`` tickers' DataFrames in RAM, then concat them to a
-    single DataFrame and append to an on-disk parquet shard. Final
-    concat reads the shards back in one pass. Without this, a 5500-
-    ticker financials pass held 5500 small DataFrames plus the final
-    concat doubled memory on the same line — pushed the 2G ECS into
-    swap / OOM kill territory.
+    Memory discipline for 2G ECS runners (Wave 10):
+
+    1. Bounded pending buffer — flush to parquet shard every
+       ``flush_every`` tickers so pandas list<DataFrame> never grows
+       unbounded.
+    2. Memory watermark — after each fetch, check /proc/meminfo's
+       ``MemAvailable``. Under 200 MB triggers an early flush + GC
+       regardless of flush_every counter. This catches runaway cases
+       where a single ticker returns an unexpectedly large DataFrame
+       or upstream schema change balloons row count.
+    3. On-disk shard → final concat reads shards one at a time.
+       Peak RAM ≈ one shard + growing result DF, not 5500 DFs.
 
     Strict serial throttle: fewer requests per unit time *is* the
     point after the Eastmoney IP ban of 2026-04 taught us that.
     5500 × 1.5s ≈ 2.3h. Records failures with exception class at
     DEBUG level so a post-run investigation can tell what failed.
     """
+    import gc
     import tempfile
     shard_dir = Path(tempfile.mkdtemp(prefix=f"mirror-{label}-", dir="/tmp"))
     shards: list[Path] = []
     pending: list[pd.DataFrame] = []
     failed_samples: list[str] = []
     failed = 0
+    low_mem_flushes = 0
 
     def _flush() -> None:
         if not pending:
@@ -505,17 +531,36 @@ def _per_ticker_serial(
                 log.debug("  %s failed %s: %s", label, code, e)
             if i % 200 == 0:
                 log.info(
-                    "  %s %d/%d (%d failed, %d shards, %d pending, samples=%s)",
+                    "  %s %d/%d (%d failed, %d shards, %d pending, "
+                    "low_mem_flushes=%d, samples=%s)",
                     label, i, len(codes), failed, len(shards),
-                    len(pending), failed_samples[:3],
+                    len(pending), low_mem_flushes, failed_samples[:3],
                 )
+            # Size-based flush
             if i % flush_every == 0:
                 _flush()
+                gc.collect()
+                continue
+            # Memory-watermark flush — cheap (reads /proc/meminfo).
+            # Only check every 50 tickers to amortise the syscall cost.
+            if i % 50 == 0:
+                avail = _available_memory_bytes()
+                if avail is not None and avail < _LOW_MEM_THRESHOLD_BYTES:
+                    log.warning(
+                        "  %s low-memory flush at i=%d (available=%dMB < %dMB)",
+                        label, i, avail // (1024 * 1024),
+                        _LOW_MEM_THRESHOLD_BYTES // (1024 * 1024),
+                    )
+                    _flush()
+                    gc.collect()
+                    low_mem_flushes += 1
         # Flush any leftover
         _flush()
         if failed:
             log.warning("  %s total failures: %d (first 10: %s)",
                         label, failed, failed_samples)
+        if low_mem_flushes:
+            log.warning("  %s triggered %d low-memory flushes", label, low_mem_flushes)
         if not shards:
             return pd.DataFrame()
         # Read shards back for final concat. At this point pending is
