@@ -778,11 +778,27 @@ def fetch_filings() -> dict:
         "announcementId": "announcement_id", "orgId": "org_id",
     }
     df = df.rename(columns=rename)
+    # Dedup: cninfo's hisAnnouncement pagination emits overlapping windows
+    # (in practice every 30-row page repeats across ~15 consecutive pages
+    # — audit 2026-04-23: 3000 real filings observed as 44850 rows).
+    # 公告链接 carries a unique announcementId per filing, so it's the
+    # authoritative key. Keep first occurrence to preserve the earliest
+    # announcement_time stamp.
+    before = len(df)
+    url_col = "公告链接" if "公告链接" in df.columns else "announcement_url"
+    if url_col in df.columns:
+        df = df.drop_duplicates(subset=[url_col], keep="first").reset_index(drop=True)
+    else:
+        df = df.drop_duplicates(subset=["code", "title", "announcement_time"], keep="first").reset_index(drop=True)
+    after = len(df)
+    if before != after:
+        log.info("  filings dedup: %d → %d rows (%d duplicates dropped)",
+                 before, after, before - after)
     # Stamp mirror-fetch date so slate can age/gap-detect.
     df["mirror_fetch_date"] = today.isoformat()
     _write_parquet(df, "filings/latest.parquet")
     kb = _write_parquet(df, f"filings/history/{today.isoformat()}.parquet")
-    return {"rows": len(df), "size_kb": kb, "window_days": 7}
+    return {"rows": len(df), "size_kb": kb, "window_days": 7, "dup_dropped": before - after}
 
 
 # ── endpoint registry + cadence ─────────────────────────────────────────

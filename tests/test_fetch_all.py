@@ -266,3 +266,72 @@ def test_merge_all_null_close_skipped(tmp_path, monkeypatch):
     after = pd.read_parquet(path)
     assert len(after) == 1
     assert after.iloc[0]["close"] == 10.0
+
+
+# ── fetch_filings dedup ───────────────────────────────────────────────
+
+
+def test_fetch_filings_dedups_pagination_overlap(tmp_path, monkeypatch):
+    """cninfo's hisAnnouncement pagination emits overlapping windows
+    (observed 15× repeats in prod: 3000 real filings as 44850 rows).
+    fetch_filings must dedupe by 公告链接 before writing parquet."""
+    fa = _sandbox(monkeypatch, tmp_path)
+
+    # Synthesise a response with 3 unique announcements each repeated 5×.
+    unique_rows = []
+    for ann_id in ("1001", "1002", "1003"):
+        unique_rows.append({
+            "代码": "605108", "简称": "同庆楼",
+            "公告标题": f"公告标题{ann_id}",
+            "公告时间": f"2026-04-23 10:{int(ann_id[-1]):02d}:00",
+            "公告链接": f"http://www.cninfo.com.cn/new/disclosure/detail?stockCode=605108&announcementId={ann_id}&orgId=x",
+        })
+    raw = pd.DataFrame(unique_rows * 5)  # 15 rows, 3 unique
+    assert len(raw) == 15
+
+    monkeypatch.setattr(
+        fa.ak, "stock_zh_a_disclosure_report_cninfo",
+        lambda **kw: raw,
+    )
+
+    result = fa.fetch_filings()
+    assert result["rows"] == 3
+    assert result["dup_dropped"] == 12
+
+    parquet = pd.read_parquet(fa.DATA_DIR / "filings" / "latest.parquet")
+    assert len(parquet) == 3
+    # Unique announcement IDs preserved
+    ann_ids = sorted(parquet["公告链接"].str.extract(r"announcementId=(\d+)")[0].tolist())
+    assert ann_ids == ["1001", "1002", "1003"]
+
+
+def test_fetch_filings_no_dupes_passthrough(tmp_path, monkeypatch):
+    """If upstream returns clean data (no dupes), dedup is a no-op."""
+    fa = _sandbox(monkeypatch, tmp_path)
+    clean = pd.DataFrame([
+        {"代码": "000001", "简称": "平安银行",
+         "公告标题": "公告A", "公告时间": "2026-04-23 09:00:00",
+         "公告链接": "http://www.cninfo.com.cn/new/disclosure/detail?announcementId=2001"},
+        {"代码": "600000", "简称": "浦发银行",
+         "公告标题": "公告B", "公告时间": "2026-04-23 09:05:00",
+         "公告链接": "http://www.cninfo.com.cn/new/disclosure/detail?announcementId=2002"},
+    ])
+    monkeypatch.setattr(
+        fa.ak, "stock_zh_a_disclosure_report_cninfo",
+        lambda **kw: clean,
+    )
+    result = fa.fetch_filings()
+    assert result["rows"] == 2
+    assert result["dup_dropped"] == 0
+
+
+def test_fetch_filings_empty_response(tmp_path, monkeypatch):
+    """Empty upstream response is a clean no-op, not an error."""
+    fa = _sandbox(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        fa.ak, "stock_zh_a_disclosure_report_cninfo",
+        lambda **kw: pd.DataFrame(),
+    )
+    result = fa.fetch_filings()
+    assert result["rows"] == 0
+    assert "note" in result
