@@ -134,14 +134,26 @@
       "last_error": null,
       "fail_streak": 0,
       "last_success": "2026-04-23T13:58:22.470037+00:00"
+    },
+    "concepts": {
+      "last_attempt": "2026-04-23T18:50:54.131925+00:00",
+      "last_error": "ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+      "last_error_at": "2026-04-23T18:50:54.131960+00:00",
+      "fail_streak": 1
+    },
+    "industries": {
+      "last_attempt": "2026-04-23T18:51:53.762258+00:00",
+      "last_error": "ConnectionError: ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))",
+      "last_error_at": "2026-04-23T18:51:53.762289+00:00",
+      "fail_streak": 1
     }
   },
   "last_pass": {
-    "at": "2026-04-23T15:24:15.786672+00:00",
-    "succeeded": 8,
-    "failed": 0,
+    "at": "2026-04-23T18:51:53.770386+00:00",
+    "succeeded": 0,
+    "failed": 2,
     "skipped": 0,
-    "elapsed_s": 779.5
+    "elapsed_s": 118.1
   },
-  "updated_at": "2026-04-23T15:24:15.786706+00:00"
+  "updated_at": "2026-04-23T18:51:53.770430+00:00"
 }
