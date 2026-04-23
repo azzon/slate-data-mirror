@@ -1,15 +1,16 @@
 {
   "endpoints": {
     "securities": {
-      "last_success": "2026-04-22T21:25:11.601278+00:00",
-      "last_elapsed_s": 2.8,
+      "last_success": "2026-04-23T03:24:06.809646+00:00",
+      "last_elapsed_s": 8.8,
       "last_meta": {
-        "rows": 5648,
-        "size_kb": 93,
-        "source": "tencent"
+        "rows": 5508,
+        "size_kb": 90,
+        "source": "akshare"
       },
       "last_error": null,
-      "fail_streak": 0
+      "fail_streak": 0,
+      "last_attempt": "2026-04-23T03:24:06.809646+00:00"
     },
     "market_daily": {
       "last_success": "2026-04-22T10:27:50.943302+00:00",
@@ -105,5 +106,5 @@
     "skipped": 0,
     "elapsed_s": 85.5
   },
-  "updated_at": "2026-04-22T21:25:28.645339+00:00"
+  "updated_at": "2026-04-23T03:24:06.810409+00:00"
 }
