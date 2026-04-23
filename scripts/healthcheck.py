@@ -52,6 +52,12 @@ MIN_ROWS = {
     "concepts": 50,           # board count floor
     "industries": 50,
     "shareholders": 100,
+    # filings: 7-day rolling window of 沪深京 announcements.
+    # Typical business day: ~3000 new filings; 7 days × 3000 = ~20000.
+    # Holidays and quiet weeks drop this; 500 is a conservative floor
+    # that catches "empty DF from schema break" without false-alarming
+    # on a legitimate golden-week lull.
+    "filings": 500,
     # news/lhb/yjyg/margin legitimately have empty days — no floor
 }
 

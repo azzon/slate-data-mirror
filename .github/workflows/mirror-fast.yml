@@ -76,7 +76,12 @@ jobs:
           MIRROR_AKSHARE_SLEEP: "1.5"
         run: |
           if [ -z "$ONLY" ]; then
-            ONLY="securities,macro,north_flow,lhb,yjyg,margin,news"
+            # filings added — 7-day rolling window of 沪深京 announcements
+            # from cninfo. Slate on the consumer side can't reach cninfo
+            # through Intel's proxy (blocked as "Finance and Banking"),
+            # so this mirror endpoint is the ONLY path that populates
+            # fact_deep downstream. 6h cadence.
+            ONLY="securities,macro,filings,north_flow,lhb,yjyg,margin,news"
           fi
           args="--only $ONLY"
           if [ "$FORCE" = "true" ]; then args="$args --force"; fi
