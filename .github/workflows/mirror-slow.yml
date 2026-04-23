@@ -53,22 +53,13 @@ jobs:
     # 4h hard cap per chunk — each chunk sized to fit comfortably.
     timeout-minutes: 240
     steps:
-      - name: Checkout via SSH-over-443
+      - name: Checkout via SSH-over-443 + disk-budget re-shallow
         timeout-minutes: 5
-        run: |
-          set -e
-          WORK="${{ github.workspace }}"
-          mkdir -p "$WORK"
-          cd "$WORK"
-          if [ -d .git ]; then
-            git remote set-url origin git@github.com:azzon/slate-data-mirror.git
-            git fetch --depth=1 origin main
-            git checkout --detach FETCH_HEAD
-            git clean -fd -e .venv -e .cache -e __pycache__
-            git gc --auto --quiet || true
-          else
-            git clone --depth 1 git@github.com:azzon/slate-data-mirror.git .
-          fi
+        env:
+          WORK: ${{ github.workspace }}
+          REPO_URL: git@github.com:azzon/slate-data-mirror.git
+          GIT_BUDGET_MB: "300"
+        run: bash /home/runner/mirror-checkout.sh
 
       - name: Ensure Python deps
         run: |
