@@ -649,9 +649,18 @@ def fetch_financials() -> dict:
     full = pd.concat(chunk_dfs, ignore_index=True) if chunk_dfs else df_chunk
     # Defensive dedup — if two chunks accidentally overlap (shouldn't
     # happen with i%7 indexing but belt & suspenders for rewrites),
-    # keep the latest write per (code, item).
-    dedup_cols = [c for c in ("code", "item") if c in full.columns]
-    if dedup_cols:
+    # keep the latest write per (code, indicator).
+    #
+    # CRITICAL: the AKShare stock_financial_abstract DataFrame's
+    # indicator column is "指标", NOT "item". An earlier version used
+    # ("code", "item") and since "item" never existed in `full.columns`,
+    # dedup fell back to ("code",) alone and slashed every ticker's
+    # 70-indicator dataset down to 1 row. This silently reduced
+    # latest.parquet from ~63,000 rows to 787 (one per ticker, whichever
+    # indicator happened to be first), corrupting slate's
+    # ingest_financials which then only saw 应付账款周转率.
+    dedup_cols = [c for c in ("code", "指标") if c in full.columns]
+    if len(dedup_cols) >= 2:
         full = full.drop_duplicates(subset=dedup_cols, keep="last")
 
     today = _today_cn().isoformat()
