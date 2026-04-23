@@ -1,11 +1,18 @@
-name: Filings history backfill
+name: History backfill (filings + lhb + yjyg)
 
-# One-shot 5-year cninfo filings backfill (Wave 11).
+# One-shot + scheduled 5-year history backfill (Wave 12).
 #
-# Why: the normal fetch_filings cron covers a rolling 30-day window
-# (W11). For SLATE's grade(scope='signal') to have a 1y+ historical
-# signal_history base, we need to pre-populate history/YYYY-MM-DD.parquet
-# for every trading day going back ~5 years.
+# Why: SLATE's grade(scope='signal') needs 1y+ historical data to be
+# meaningful. This workflow populates all "per-day historical" endpoints:
+#   - filings  (cninfo 公告)    → 5y
+#   - lhb      (龙虎榜)          → 5y
+#   - yjyg     (业绩预告)         — now done inline in fetch_yjyg (20q)
+#
+# Each backfill script:
+#   - Resumable via data/_{endpoint}_backfill_progress.json
+#   - Skips days with existing parquet (immutable once written)
+#   - 60-day commit batches (crash-safe)
+#   - Peak-skip 15:00-17:00 CST
 #
 # Design:
 # - Serial per-day akshare calls with AKSHARE_SLEEP=1.5s throttle
@@ -88,13 +95,16 @@ jobs:
           git config user.name "slate-mirror-bot"
           git remote set-url origin git@github.com:azzon/slate-data-mirror.git
 
-      - name: Run backfill
+      - name: Run filings backfill
         env:
           START_DATE: ${{ github.event.inputs.start_date }}
           END_DATE: ${{ github.event.inputs.end_date }}
           BATCH_DAYS: ${{ github.event.inputs.batch_days || '60' }}
           MAX_ERRORS: ${{ github.event.inputs.max_errors || '20' }}
           MIRROR_AKSHARE_SLEEP: "1.5"
+        # continue-on-error — if filings backfill hits max_errors we
+        # still want LHB to get its share of the runner time.
+        continue-on-error: true
         run: |
           args=""
           [ -n "$START_DATE" ] && args="$args --start-date $START_DATE"
@@ -104,13 +114,30 @@ jobs:
           echo "Running: scripts/backfill_filings.py $args"
           .venv/bin/python scripts/backfill_filings.py $args
 
+      - name: Run LHB backfill
+        env:
+          START_DATE: ${{ github.event.inputs.start_date }}
+          END_DATE: ${{ github.event.inputs.end_date }}
+          BATCH_DAYS: ${{ github.event.inputs.batch_days || '60' }}
+          MAX_ERRORS: ${{ github.event.inputs.max_errors || '20' }}
+          MIRROR_AKSHARE_SLEEP: "1.5"
+        continue-on-error: true
+        run: |
+          args=""
+          [ -n "$START_DATE" ] && args="$args --start-date $START_DATE"
+          [ -n "$END_DATE" ] && args="$args --end-date $END_DATE"
+          [ -n "$BATCH_DAYS" ] && args="$args --batch-days $BATCH_DAYS"
+          [ -n "$MAX_ERRORS" ] && args="$args --max-errors $MAX_ERRORS"
+          echo "Running: scripts/backfill_lhb.py $args"
+          .venv/bin/python scripts/backfill_lhb.py $args
+
       - name: Final sweep push
         if: always()
         run: |
-          git add data/filings/history/ data/_filings_backfill_progress.json
+          git add data/
           if git diff --cached --quiet; then
             echo "nothing to sweep"
             exit 0
           fi
-          git commit -m "backfill(filings): final sweep $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -m "backfill: final sweep $(date -u +%Y-%m-%dT%H:%MZ)"
           git push origin HEAD:main

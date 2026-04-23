@@ -117,6 +117,57 @@ def test_backfill_resumes_from_progress(tmp_path, monkeypatch):
     ]
 
 
+def test_backfill_handles_upstream_schema_gap(tmp_path, monkeypatch):
+    """Wave 12: pre-2021 cninfo dates trigger akshare KeyError on
+    column rename. Treat as permanent gap — don't count toward
+    max_errors, persist to _filings_schema_gap.json for future skip."""
+    bf = _fresh(monkeypatch, tmp_path)
+    monkeypatch.setattr(bf, "AKSHARE_SLEEP", 0.0)
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda s: None)
+
+    def _akshare(**kw):
+        ds = kw.get("start_date")
+        # Pre-20260410 dates simulate historical schema gap
+        if ds < "20260410":
+            raise KeyError(
+                "None of [Index(['代码', '简称', '公告标题', '公告时间', "
+                "'announcementId', 'orgId'], dtype='str')] are in the [columns]"
+            )
+        import pandas as _pd
+        return _pd.DataFrame([{
+            "代码": "000001", "简称": "T",
+            "公告标题": f"ok-{ds}",
+            "公告时间": f"2026-04-{ds[-2:]} 09:00:00",
+            "公告链接": f"http://x.com/d?announcementId={ds}",
+        }])
+    monkeypatch.setattr(bf.ak, "stock_zh_a_disclosure_report_cninfo", _akshare)
+    monkeypatch.setattr(bf.subprocess, "run",
+                        lambda *a, **kw: type("R", (), {"returncode": 0, "stderr": ""})())
+
+    # Backfill from an old date to today. Should NOT abort due to
+    # max_errors — schema gaps don't count.
+    rc = bf.backfill(date(2026, 4, 1), date(2026, 4, 15),
+                     batch_days=100, max_errors=3)
+    assert rc == 0, "schema gaps must not trip max_errors"
+
+    # Days after 04-10 should be written
+    history = tmp_path / "data" / "filings" / "history"
+    files = sorted(p.stem for p in history.glob("*.parquet"))
+    assert "2026-04-10" in files
+    assert "2026-04-15" in files
+    # Days before 04-10 should NOT be written
+    assert "2026-04-01" not in files
+
+    # Schema gap file should record the gap dates
+    gap_file = tmp_path / "data" / "_filings_schema_gap.json"
+    assert gap_file.exists()
+    gaps = json.loads(gap_file.read_text())
+    assert "2026-04-01" in gaps
+    assert "2026-04-09" in gaps
+    assert "2026-04-10" not in gaps
+
+
 def test_backfill_aborts_on_too_many_errors(tmp_path, monkeypatch):
     bf = _fresh(monkeypatch, tmp_path)
     monkeypatch.setattr(bf, "AKSHARE_SLEEP", 0.0)

@@ -707,15 +707,74 @@ def fetch_north_flow() -> dict:
 
 
 def fetch_lhb() -> dict:
+    """Wave 12: 龙虎榜 historical backfill (30-day rolling + per-day cache).
+
+    Previous: 7-day rolling only — any day missed was lost forever.
+    New: 30-day rolling with per-day parquet cache, same pattern as
+    fetch_filings. LHB data is immutable once published (day's trade
+    flow is final), so cached days never need re-fetch.
+
+    The backfill-lhb workflow pulls the deeper history (~5y) on the
+    same cron slot as backfill-filings.
+    """
     today = _today_cn()
-    start = (today - timedelta(days=7)).strftime("%Y%m%d")
-    end = today.strftime("%Y%m%d")
-    df = _ak_call(ak.stock_lhb_detail_em, start_date=start, end_date=end)
-    if df is None or df.empty:
-        return {"rows": 0, "note": "no lhb rows in window"}
-    _write_parquet(df, "lhb/latest.parquet")
-    kb = _write_parquet(df, f"lhb/history/{today.isoformat()}.parquet")
-    return {"rows": len(df), "size_kb": kb}
+    lhb_hist_dir = DATA_DIR / "lhb" / "history"
+    lhb_hist_dir.mkdir(parents=True, exist_ok=True)
+
+    frames: list[pd.DataFrame] = []
+    window_days = 30
+    per_day_ok = 0
+    per_day_err = 0
+    per_day_cached = 0
+
+    for offset in range(window_days):
+        d = today - timedelta(days=offset)
+        ds_iso = d.isoformat()
+        shard = lhb_hist_dir / f"{ds_iso}.parquet"
+        # Today + yesterday: always re-fetch (late publication)
+        # offset ≥ 2: cache if exists
+        if offset >= 2 and shard.exists():
+            try:
+                df_c = pd.read_parquet(shard)
+                if not df_c.empty:
+                    frames.append(df_c)
+                    per_day_cached += 1
+                    continue
+            except Exception:
+                pass
+
+        ds_ak = d.strftime("%Y%m%d")
+        try:
+            df_day = _ak_call(
+                ak.stock_lhb_detail_em,
+                start_date=ds_ak, end_date=ds_ak,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("  lhb %s failed: %s", ds_ak, e)
+            per_day_err += 1
+            continue
+        if df_day is None or df_day.empty:
+            continue
+        df_day = df_day.copy()
+        df_day.to_parquet(shard, compression="zstd", index=False)
+        frames.append(df_day)
+        per_day_ok += 1
+
+    if not frames:
+        return {
+            "rows": 0,
+            "note": f"no lhb rows in {window_days}-day window",
+        }
+    out = pd.concat(frames, ignore_index=True)
+    kb = _write_parquet(out, "lhb/latest.parquet")
+    return {
+        "rows": len(out),
+        "size_kb": kb,
+        "window_days": window_days,
+        "days_ok": per_day_ok,
+        "days_err": per_day_err,
+        "days_cached": per_day_cached,
+    }
 
 
 def fetch_shareholders() -> dict:
@@ -728,37 +787,72 @@ def fetch_shareholders() -> dict:
 
 
 def fetch_yjyg() -> dict:
+    """Wave 12: historical yjyg (业绩预告) covering last 20 quarters (5 years).
+
+    Previous: 4 quarters. Reasoning for 20:
+    - grade(scope='signal') needs historical earnings-surprise data to
+      backtest the signal; 4 quarters is not enough statistical power.
+    - Per-quarter parquet is cached under history/. Already-fetched
+      quarters are skipped so runtime stays bounded at ~2-3 API calls
+      (just the newest quarter + re-verify current quarter).
+    - First full-run: 20 × 1.5s = 30s incremental.
+    """
     today = _today_cn()
-    # Last 4 CLOSED quarter-ends. A quarter-end on or equal to today is
-    # not yet reported; start from the most recent strictly-past one.
+    # Walk back 20 CLOSED quarter-ends.
     quarters = []
     y, m = today.year, today.month
     q_end_months = [3, 6, 9, 12]
-    for _ in range(4):
-        # Find largest quarter-end strictly before today (m-1 so March
-        # doesn't pretend 2026-03-31 is closed)
+    for _ in range(20):
         candidates = [qm for qm in q_end_months if qm < m] or q_end_months
         qm = max(candidates)
-        if qm >= m:  # rolled back to previous year
+        if qm >= m:
             y -= 1
         last_day = {3: 31, 6: 30, 9: 30, 12: 31}[qm]
         quarters.append(f"{y}{qm:02d}{last_day:02d}")
-        m = qm  # next iter finds the quarter-end before this one
-    frames = []
-    for q in quarters:
+        m = qm
+
+    yjyg_hist_dir = DATA_DIR / "yjyg" / "history"
+    yjyg_hist_dir.mkdir(parents=True, exist_ok=True)
+    frames: list[pd.DataFrame] = []
+    fetched = 0
+    cached = 0
+    # The most recent 2 quarters may still get revisions (late filers);
+    # always re-fetch those. Older quarters are immutable.
+    for i, q in enumerate(quarters):
+        shard = yjyg_hist_dir / f"{q}.parquet"
+        if i >= 2 and shard.exists():
+            try:
+                df_c = pd.read_parquet(shard)
+                if not df_c.empty:
+                    frames.append(df_c)
+                    cached += 1
+                    continue
+            except Exception as e:
+                log.warning("  yjyg cached %s unreadable: %s", q, e)
         try:
             df = _ak_call(ak.stock_yjyg_em, date=q)
             if df is not None and not df.empty:
                 df = df.copy()
                 df["report_period"] = q
+                df.to_parquet(shard, compression="zstd", index=False)
                 frames.append(df)
+                fetched += 1
         except Exception as e:  # noqa: BLE001
             log.warning("  yjyg %s failed: %s", q, e)
     if not frames:
         return {"rows": 0, "note": "no yjyg data"}
     out = pd.concat(frames, ignore_index=True)
+    # Dedup across overlapping quarters (shouldn't happen but safe).
+    if "股票代码" in out.columns and "report_period" in out.columns:
+        out = out.drop_duplicates(subset=["股票代码", "report_period"], keep="last")
     kb = _write_parquet(out, "yjyg/latest.parquet")
-    return {"rows": len(out), "size_kb": kb, "quarters": quarters}
+    return {
+        "rows": len(out),
+        "size_kb": kb,
+        "quarters": len(quarters),
+        "fetched": fetched,
+        "cached": cached,
+    }
 
 
 def fetch_margin() -> dict:

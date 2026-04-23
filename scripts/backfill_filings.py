@@ -87,8 +87,16 @@ def _save_progress(p: dict) -> None:
     tmp.replace(PROGRESS_FILE)
 
 
+class UpstreamSchemaGap(Exception):
+    """akshare's column-rename fails on historical dates (pre ~2021-11-22).
+    Signals 'upstream has no data for this date' rather than 'transient
+    error'. Backfill treats this as a permanent gap, not a counted error."""
+
+
 def _fetch_one_day(d: date) -> pd.DataFrame | None:
-    """Single-day cninfo call with retry. Returns None on hard failure."""
+    """Single-day cninfo call with retry. Returns None on transient
+    failure (counts toward max_errors). Raises UpstreamSchemaGap when
+    the date is pre-akshare-schema (permanent gap, doesn't retry)."""
     ds = d.strftime("%Y%m%d")
     last_err = None
     for attempt in range(3):
@@ -102,13 +110,21 @@ def _fetch_one_day(d: date) -> pd.DataFrame | None:
                 end_date=ds,
             )
             return df
+        except KeyError as e:
+            # akshare's df[[...]] column lookup on pre-rename cninfo
+            # response. Permanent — date is before their normaliser
+            # was written. Don't retry.
+            msg = str(e)
+            if "代码" in msg or "announcementId" in msg:
+                raise UpstreamSchemaGap(f"akshare schema gap for {ds}") from e
+            last_err = e
         except Exception as e:  # noqa: BLE001
             last_err = e
-            if attempt < 2:
-                delay = 5 * (attempt + 1)
-                log.warning("  %s try %d/3 failed (%s), retry in %ds",
-                            ds, attempt + 1, type(e).__name__, delay)
-                time.sleep(delay)
+        if attempt < 2:
+            delay = 5 * (attempt + 1)
+            log.warning("  %s try %d/3 failed (%s), retry in %ds",
+                        ds, attempt + 1, type(last_err).__name__, delay)
+            time.sleep(delay)
     log.error("  %s all retries failed: %s", ds, last_err)
     return None
 
@@ -174,11 +190,24 @@ def backfill(
     days_attempted = 0
     days_succeeded = 0
     days_skipped = 0
+    days_schema_gap = 0
     rows_total = 0
     errors = 0
     batch_start = cursor
 
-    log.info("backfill: cursor=%s end=%s batch_days=%d", cursor, end_date, batch_days)
+    # schema-gap marker file — dates where akshare's historical support
+    # ends. Pre-marker dates get skipped immediately on subsequent runs
+    # so we don't retry the same 1000+ days of KeyError forever.
+    gap_file = DATA_DIR / "_filings_schema_gap.json"
+    schema_gap_dates: set[str] = set()
+    if gap_file.exists():
+        try:
+            schema_gap_dates = set(json.loads(gap_file.read_text()))
+        except Exception:  # noqa: BLE001
+            schema_gap_dates = set()
+
+    log.info("backfill: cursor=%s end=%s batch_days=%d gap_known=%d",
+             cursor, end_date, batch_days, len(schema_gap_dates))
 
     while cursor <= end_date:
         # Skip peak window — just sleep past it.
@@ -192,9 +221,41 @@ def backfill(
             cursor += timedelta(days=1)
             continue
 
+        if cursor.isoformat() in schema_gap_dates:
+            days_schema_gap += 1
+            cursor += timedelta(days=1)
+            continue
+
         days_attempted += 1
         time.sleep(AKSHARE_SLEEP)
-        df = _fetch_one_day(cursor)
+        try:
+            df = _fetch_one_day(cursor)
+        except UpstreamSchemaGap:
+            # Permanent: akshare has no historical support for this date.
+            # Record to gap_file so future runs skip immediately. Once
+            # we see 3 consecutive gap days, walk cursor back to
+            # end_date (it's a lost cause — everything older has the
+            # same schema issue).
+            schema_gap_dates.add(cursor.isoformat())
+            days_schema_gap += 1
+            # Persist gap file periodically (every 10 new gaps).
+            if days_schema_gap % 10 == 1:
+                gap_file.write_text(
+                    json.dumps(sorted(schema_gap_dates), ensure_ascii=False),
+                )
+            # If we've hit 30 consecutive gap days, akshare is definitely
+            # done. Stop the scan — any older dates will have the same
+            # KeyError. This keeps future runs from wasting API calls.
+            recent_gap = all(
+                (cursor - timedelta(days=k)).isoformat() in schema_gap_dates
+                for k in range(30)
+            )
+            if recent_gap and days_attempted > 30:
+                log.warning("  30 consecutive schema gaps — akshare has no "
+                            "pre-%s support, stopping scan", cursor)
+                break
+            cursor += timedelta(days=1)
+            continue
         if df is None:
             errors += 1
             if errors >= max_errors:
@@ -220,13 +281,18 @@ def backfill(
 
         cursor += timedelta(days=1)
 
-    # Final commit
+    # Final commit + persist gap file
     _save_progress(progress)
-    if days_succeeded > 0:
+    if schema_gap_dates:
+        gap_file.write_text(
+            json.dumps(sorted(schema_gap_dates), ensure_ascii=False),
+        )
+    if days_succeeded > 0 or schema_gap_dates:
         _git_commit_batch(batch_start, cursor - timedelta(days=1), days_succeeded)
     log.info(
-        "done: attempted=%d succeeded=%d skipped=%d rows=%d errors=%d",
-        days_attempted, days_succeeded, days_skipped, rows_total, errors,
+        "done: attempted=%d succeeded=%d skipped=%d schema_gaps=%d rows=%d errors=%d",
+        days_attempted, days_succeeded, days_skipped,
+        days_schema_gap, rows_total, errors,
     )
     return 0 if errors < max_errors else 1
 
