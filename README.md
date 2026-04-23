@@ -66,6 +66,19 @@ rows and `slate doctor` flags the drift.
 looking at the repo can tell at a glance whether a given data group is
 live or stale.
 
+Automated health check runs 3×/day on a GitHub-hosted runner
+(`.github/workflows/healthcheck.yml`). When an endpoint's
+`fail_streak >= 3` or staleness exceeds 2× its cadence, it opens (or
+updates) a single `mirror-health` issue with the details.
+
+## Operations
+
+- **[RUNBOOK.md](RUNBOOK.md)** — symptom → fix index for common failures
+  (runner offline, upstream flake, bootstrap resume, runner upgrade).
+- **[CI](.github/workflows/ci.yml)** — pure-Python unit tests on
+  GitHub-hosted runners, no network access, catches regressions in
+  cadence / merge / health-check logic before cron jobs run them.
+
 ## License
 
 Code: MIT. Data: relayed from upstream sources; use at your own risk,
