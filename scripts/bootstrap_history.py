@@ -240,6 +240,12 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
     completed = 0
     CHUNK_TIMEOUT_S = 300
 
+    # Batch git pushes every PUSH_EVERY_CHUNKS to stay well below the
+    # GitHub secondary rate limit of ~1000 writes/hour. At chunk=50 and
+    # ~1 chunk/min, 5-chunk batching = 12 pushes/hour ceiling.
+    PUSH_EVERY_CHUNKS = 5
+    chunks_since_push = 0
+
     import multiprocessing as mp
     # 'spawn' avoids fork-inheriting httpx pool state from prior chunks.
     mp_ctx = mp.get_context("spawn")
@@ -293,23 +299,27 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
                  completed, len(todo), len(new_done), len(new_failed),
                  rate, eta_min)
 
-        # Flush + checkpoint + push after every chunk.
+        # Flush + checkpoint every chunk; push every N chunks to stay
+        # under GitHub's secondary write rate limit.
         # failed_codes: merge with prior so tickers that failed on
         # *earlier* runs aren't forgotten when this run skipped them.
         flush_chunk()
         done.update(new_done)
         merged_failed = {**failed_prior, **new_failed}
-        # Remove any ticker that now succeeded
         for t in new_done:
             merged_failed.pop(t, None)
         progress["market_daily"]["done_codes"] = sorted(done)
         progress["market_daily"]["failed_codes"] = merged_failed
         progress["market_daily"]["last_checkpoint"] = datetime.now(timezone.utc).isoformat()
         _save_progress(progress)
-        _git_push(
-            f"bootstrap(market_daily): +{processed_in_chunk} ok, "
-            f"{len(merged_failed)} fail total ({len(done)}/{len(all_tickers)} total)"
-        )
+
+        chunks_since_push += 1
+        if chunks_since_push >= PUSH_EVERY_CHUNKS:
+            _git_push(
+                f"bootstrap(market_daily): {len(done)}/{len(all_tickers)} done, "
+                f"{len(merged_failed)} fail (+{processed_in_chunk} in latest chunk)"
+            )
+            chunks_since_push = 0
         processed_in_chunk = 0
 
     # Final flush (safety — chunk loop flushes every iter).
@@ -359,22 +369,22 @@ def _sanity_check_market_daily(*, expected_years: int, min_daily_tickers: int = 
             f"sanity: only {len(files)} parquet files, expected >= {expected} for {expected_years}y"
         )
 
-    # 2. Row-count floor for recent files
+    # 2. Row-count floor for recent files. Cache counts so check #3
+    #    doesn't re-read the same parquets a second time — saves ~2 min
+    #    of IO at the tail of a 3-hour bootstrap.
     recent = files[-90:]
-    bad: list[str] = []
-    for p in recent:
-        n = len(pd.read_parquet(p))
-        if n < min_daily_tickers:
-            bad.append(f"{p.name}={n}")
+    counts_by_path: dict = {p: len(pd.read_parquet(p)) for p in recent}
+    bad = [f"{p.name}={n}" for p, n in counts_by_path.items()
+           if n < min_daily_tickers]
     if bad:
         raise RuntimeError(
             f"sanity: {len(bad)} recent files below {min_daily_tickers}-ticker floor: {bad[:5]}"
         )
 
-    # 3. Coverage drift — median ticker count in last 30 days
+    # 3. Coverage drift — median ticker count in last 30 days (reused cache)
     recent30 = files[-30:]
     if recent30:
-        counts = [len(pd.read_parquet(p)) for p in recent30]
+        counts = [counts_by_path[p] for p in recent30]
         median_recent = sorted(counts)[len(counts) // 2]
         log.info("sanity: OK — %d files, median %d tickers/day in last 30 days",
                  len(files), median_recent)

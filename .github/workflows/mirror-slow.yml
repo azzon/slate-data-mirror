@@ -27,7 +27,8 @@ on:
         default: "false"
 
 concurrency:
-  group: mirror
+  # Own group so the 3h weekly pass doesn't block fast/market crons.
+  group: mirror-slow
   cancel-in-progress: false
 
 jobs:

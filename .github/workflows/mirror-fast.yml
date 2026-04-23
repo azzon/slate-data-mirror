@@ -25,7 +25,11 @@ on:
         default: "false"
 
 concurrency:
-  group: mirror
+  # Own group so a running market_daily pass (up to 30 min) doesn't
+  # queue news/yjyg/lhb fetches. The single self-hosted runner
+  # serialises anyway, but GitHub's scheduler will pick up a queued
+  # fast workflow immediately after the previous job's runner releases.
+  group: mirror-fast
   cancel-in-progress: false
 
 jobs:

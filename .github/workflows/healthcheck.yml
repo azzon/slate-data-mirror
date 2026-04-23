@@ -1,0 +1,56 @@
+name: Mirror healthcheck
+
+# Runs on GitHub-hosted runners (no data access needed — just reads
+# committed _status.json from the repo), so it's immune to self-hosted
+# runner outages. Opens a GitHub issue when any endpoint has been
+# failing for 3+ consecutive attempts or is stale beyond 2× cadence.
+#
+# Runs 3×/day at 03:00, 11:00, 19:00 UTC (CN 11:00/19:00/03:00) —
+# spread out so one flake doesn't dominate.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+    - cron: "0 11 * * *"
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Analyze _status.json
+        id: analyze
+        run: |
+          python3 scripts/healthcheck.py > /tmp/hc.out || true
+          cat /tmp/hc.out
+          # emit findings so the next step can branch
+          if grep -q '^ALERT' /tmp/hc.out; then
+            echo "has_alert=yes" >> "$GITHUB_OUTPUT"
+            echo "body_file=/tmp/hc.out" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_alert=no" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Open / update tracking issue
+        if: steps.analyze.outputs.has_alert == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Reuse an existing "mirror-health" issue if present; else create.
+          existing=$(gh issue list --label mirror-health --state open --json number --jq '.[0].number')
+          body=$(cat /tmp/hc.out)
+          if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$body"
+          else
+              gh issue create --title "mirror health: endpoints unhealthy" \
+                              --label mirror-health \
+                              --body "$body"
+          fi

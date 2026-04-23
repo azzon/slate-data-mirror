@@ -271,20 +271,29 @@ def _recent_row_median(today: date, *, window_days: int = 30) -> int:
 def _merge_market_daily(df: pd.DataFrame, d: date) -> int:
     """Write `df` to today's parquet, merging with any existing file.
 
-    We NEVER overwrite an existing per-day file wholesale — if Tencent
-    returned a partial universe for any reason (CDN hiccup, network
-    flake), the new frame is concat'd with the existing and deduped
-    on ticker, keeping the larger set. Returns total rows written.
+    Merge semantics — "new wins only when new is valid":
+      * Drop rows in the new frame where `close` is null/NaN (broken fetch).
+      * Concat prior + cleaned-new.
+      * Dedupe on (ticker, trade_date) keeping LAST — now safe because
+        any null-close new row was already stripped, so "last" is always
+        a real row.
+
+    Without the pre-strip, a Tencent CDN hiccup that returns `close=NaN`
+    for a ticker would overwrite a healthy prior row. With it, prior
+    stays until a real new close arrives.
     """
     path = _market_daily_path(d)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Strip rows with null close BEFORE merge — broken rows must never
+    # clobber healthy prior data via keep="last".
+    df = df.dropna(subset=["close"])
+    if df.empty:
+        log.warning("  %s: new frame has zero rows with non-null close — skip write", d)
+        return 0
     if path.exists():
         try:
             prior = pd.read_parquet(path)
             merged = pd.concat([prior, df], ignore_index=True)
-            # Prefer prior rows for same (ticker, trade_date) only when
-            # the new row is missing close — otherwise the fresh fetch
-            # wins (it's more recent).
             merged = merged.drop_duplicates(subset=["ticker", "trade_date"], keep="last")
             merged.to_parquet(path, compression="snappy", index=False)
             log.info("  merged %s (prior=%d, new=%d, total=%d)",

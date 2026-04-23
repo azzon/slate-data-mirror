@@ -18,7 +18,9 @@ on:
         default: "false"
 
 concurrency:
-  group: mirror
+  # Own group — don't let a running fast workflow's news pass block
+  # the 16:30 post-close market_daily fetch.
+  group: mirror-market
   cancel-in-progress: false
 
 jobs:
