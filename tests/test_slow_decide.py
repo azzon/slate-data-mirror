@@ -1,8 +1,15 @@
 """Tests for scripts/slow_decide.py.
 
-Slow is now chunked (Sun/Wed/Fri each run a different subset). The
-retry cron picks the stalest chunk. Regression here = wrong chunk
-runs or retry doesn't fire when it should.
+Wave 10 schema: CHUNKS is a 4-tuple (anchor, endpoints, label,
+stale_threshold_d). Four anchors with distinct thresholds:
+
+  financials     1.1d  (daily chunked — 1/7 universe per day)
+  research       6.0d  (weekly)
+  concepts       6.0d  (weekly — anchors concepts+industries)
+  shareholders   6.0d  (weekly)
+
+Regression here = wrong chunk runs or retry doesn't fire when it
+should, especially the daily financials slot vs weekly siblings.
 """
 from __future__ import annotations
 
@@ -50,11 +57,19 @@ def test_bad_json_picks_first_chunk(tmp_path, monkeypatch, capsys):
 
 
 def test_all_chunks_fresh_skips(tmp_path, monkeypatch, capsys):
-    fresh = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    """Every anchor under its own threshold → skip.
+
+    Financials' threshold is 1.1d (daily); research/concepts/
+    shareholders are 6d. So 'fresh' here means <1.1d for financials
+    and <6d for the rest — use a half-day-old timestamp which passes
+    BOTH thresholds.
+    """
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
     _patch_status(tmp_path, monkeypatch, {"endpoints": {
-        "financials": {"last_success": fresh},
-        "research":   {"last_success": fresh},
-        "concepts":   {"last_success": fresh},
+        "financials":   {"last_success": fresh},
+        "research":     {"last_success": fresh},
+        "concepts":     {"last_success": fresh},
+        "shareholders": {"last_success": fresh},
     }})
     import slow_decide
     slow_decide.main()
@@ -63,12 +78,15 @@ def test_all_chunks_fresh_skips(tmp_path, monkeypatch, capsys):
 
 
 def test_stale_research_picks_research(tmp_path, monkeypatch, capsys):
-    fresh = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    """Only research is stale (>6d). financials under its 1.1d
+    threshold, others fresh."""
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
     old = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
     _patch_status(tmp_path, monkeypatch, {"endpoints": {
-        "financials": {"last_success": fresh},
-        "research":   {"last_success": old},
-        "concepts":   {"last_success": fresh},
+        "financials":   {"last_success": fresh},
+        "research":     {"last_success": old},
+        "concepts":     {"last_success": fresh},
+        "shareholders": {"last_success": fresh},
     }})
     import slow_decide
     slow_decide.main()
@@ -78,28 +96,33 @@ def test_stale_research_picks_research(tmp_path, monkeypatch, capsys):
 
 
 def test_multiple_stale_picks_stalest(tmp_path, monkeypatch, capsys):
-    three_d = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    """Research at 20d beats financials at 8d (even though financials'
+    1.1d threshold is exceeded 8× vs research's 6d threshold exceeded
+    3×, the comparison is on raw age_d not ratio-to-threshold)."""
+    half_d = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
     eight_d = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
     twenty_d = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
     _patch_status(tmp_path, monkeypatch, {"endpoints": {
-        "financials": {"last_success": eight_d},   # 8 days stale
-        "research":   {"last_success": twenty_d},  # 20 days — stalest
-        "concepts":   {"last_success": three_d},   # fresh
+        "financials":   {"last_success": eight_d},   # 8d stale (>>1.1d threshold)
+        "research":     {"last_success": twenty_d},  # 20d — stalest (>>6d threshold)
+        "concepts":     {"last_success": half_d},    # fresh
+        "shareholders": {"last_success": half_d},    # fresh
     }})
     import slow_decide
     slow_decide.main()
     got = _capture(capsys)
     assert got["run"] == "yes"
-    # Stalest is research
+    # Stalest raw age is research (20d)
     assert got["endpoints"] == "research"
 
 
 def test_never_run_anchor_picks_that_chunk(tmp_path, monkeypatch, capsys):
-    fresh = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
     # research has no last_success at all → age 999d (stalest)
     _patch_status(tmp_path, monkeypatch, {"endpoints": {
-        "financials": {"last_success": fresh},
-        "concepts":   {"last_success": fresh},
+        "financials":   {"last_success": fresh},
+        "concepts":     {"last_success": fresh},
+        "shareholders": {"last_success": fresh},
     }})
     import slow_decide
     slow_decide.main()
@@ -109,14 +132,34 @@ def test_never_run_anchor_picks_that_chunk(tmp_path, monkeypatch, capsys):
 
 
 def test_boundary_six_days_skips(tmp_path, monkeypatch, capsys):
-    """Exactly 5d23h ago = fresh. 6d0h = stale."""
-    fresh = (datetime.now(timezone.utc) - timedelta(days=5, hours=23)).isoformat()
+    """Exactly 5d23h ago = fresh for weekly anchors. financials'
+    threshold is 1.1d so it uses a different fresh value."""
+    weekly_fresh = (datetime.now(timezone.utc) - timedelta(days=5, hours=23)).isoformat()
+    daily_fresh = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
     _patch_status(tmp_path, monkeypatch, {"endpoints": {
-        "financials": {"last_success": fresh},
-        "research":   {"last_success": fresh},
-        "concepts":   {"last_success": fresh},
+        "financials":   {"last_success": daily_fresh},
+        "research":     {"last_success": weekly_fresh},
+        "concepts":     {"last_success": weekly_fresh},
+        "shareholders": {"last_success": weekly_fresh},
     }})
     import slow_decide
     slow_decide.main()
     got = _capture(capsys)
     assert got["run"] == "no"
+
+
+def test_financials_1_day_stale_triggers(tmp_path, monkeypatch, capsys):
+    """Wave 10 daily financials: 1d7h stale > 1.1d threshold → fire."""
+    financials_stale = (datetime.now(timezone.utc) - timedelta(days=1, hours=7)).isoformat()
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat()
+    _patch_status(tmp_path, monkeypatch, {"endpoints": {
+        "financials":   {"last_success": financials_stale},
+        "research":     {"last_success": fresh},
+        "concepts":     {"last_success": fresh},
+        "shareholders": {"last_success": fresh},
+    }})
+    import slow_decide
+    slow_decide.main()
+    got = _capture(capsys)
+    assert got["run"] == "yes"
+    assert got["endpoints"] == "financials"

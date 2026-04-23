@@ -272,12 +272,15 @@ def test_merge_all_null_close_skipped(tmp_path, monkeypatch):
 
 
 def test_fetch_filings_dedups_pagination_overlap(tmp_path, monkeypatch):
-    """cninfo's hisAnnouncement pagination emits overlapping windows
-    (observed 15× repeats in prod: 3000 real filings as 44850 rows).
-    fetch_filings must dedupe by 公告链接 before writing parquet."""
+    """Wave 10: fetch_filings loops over 7 days (cninfo truncates
+    multi-day queries). Each per-day call returns 15 rows with 3
+    unique, then the final dedup across all 7 days' responses keeps
+    3 unique (same announcementId ⇒ same 公告链接).
+
+    dup_dropped = 7×15 - 3 = 102.
+    """
     fa = _sandbox(monkeypatch, tmp_path)
 
-    # Synthesise a response with 3 unique announcements each repeated 5×.
     unique_rows = []
     for ann_id in ("1001", "1002", "1003"):
         unique_rows.append({
@@ -286,7 +289,7 @@ def test_fetch_filings_dedups_pagination_overlap(tmp_path, monkeypatch):
             "公告时间": f"2026-04-23 10:{int(ann_id[-1]):02d}:00",
             "公告链接": f"http://www.cninfo.com.cn/new/disclosure/detail?stockCode=605108&announcementId={ann_id}&orgId=x",
         })
-    raw = pd.DataFrame(unique_rows * 5)  # 15 rows, 3 unique
+    raw = pd.DataFrame(unique_rows * 5)  # 15 rows per call, 3 unique
     assert len(raw) == 15
 
     monkeypatch.setattr(
@@ -296,17 +299,21 @@ def test_fetch_filings_dedups_pagination_overlap(tmp_path, monkeypatch):
 
     result = fa.fetch_filings()
     assert result["rows"] == 3
-    assert result["dup_dropped"] == 12
+    # 7-day loop: 7 calls × 15 rows = 105, unique = 3, dropped = 102
+    assert result["dup_dropped"] == 7 * 15 - 3
+    assert result["days_ok"] == 7
+    assert result["days_err"] == 0
 
     parquet = pd.read_parquet(fa.DATA_DIR / "filings" / "latest.parquet")
     assert len(parquet) == 3
-    # Unique announcement IDs preserved
     ann_ids = sorted(parquet["公告链接"].str.extract(r"announcementId=(\d+)")[0].tolist())
     assert ann_ids == ["1001", "1002", "1003"]
 
 
 def test_fetch_filings_no_dupes_passthrough(tmp_path, monkeypatch):
-    """If upstream returns clean data (no dupes), dedup is a no-op."""
+    """Wave 10: 7-day loop × 2 clean unique rows per call = 14 rows
+    before dedup, 2 after. dup_dropped = 12 (7-1 duplicates of the
+    same two rows collapsing)."""
     fa = _sandbox(monkeypatch, tmp_path)
     clean = pd.DataFrame([
         {"代码": "000001", "简称": "平安银行",
@@ -322,7 +329,9 @@ def test_fetch_filings_no_dupes_passthrough(tmp_path, monkeypatch):
     )
     result = fa.fetch_filings()
     assert result["rows"] == 2
-    assert result["dup_dropped"] == 0
+    # 7 days × 2 rows = 14 raw; 2 unique; dropped = 12
+    assert result["dup_dropped"] == 7 * 2 - 2
+    assert result["days_ok"] == 7
 
 
 def test_fetch_filings_empty_response(tmp_path, monkeypatch):
@@ -335,3 +344,70 @@ def test_fetch_filings_empty_response(tmp_path, monkeypatch):
     result = fa.fetch_filings()
     assert result["rows"] == 0
     assert "note" in result
+
+
+def test_fetch_filings_iterates_seven_days(tmp_path, monkeypatch):
+    """Wave 10: fetch_filings calls akshare 7 times (once per day)
+    with matching start_date==end_date. This verifies cninfo's
+    multi-day truncation workaround actually iterates."""
+    from datetime import timedelta
+    fa = _sandbox(monkeypatch, tmp_path)
+    calls_by_date: list[tuple[str, str]] = []
+
+    def _capture(**kw):
+        calls_by_date.append((kw.get("start_date"), kw.get("end_date")))
+        return pd.DataFrame([{
+            "代码": "000001", "简称": "平安银行",
+            "公告标题": f"公告-{kw.get('start_date')}",
+            "公告时间": f"{kw.get('start_date')[:4]}-{kw.get('start_date')[4:6]}-{kw.get('start_date')[6:]} 09:00:00",
+            "公告链接": f"http://example.com/d?announcementId={kw.get('start_date')}",
+        }])
+
+    monkeypatch.setattr(
+        fa.ak, "stock_zh_a_disclosure_report_cninfo",
+        _capture,
+    )
+    result = fa.fetch_filings()
+    # Each call is single-day (start == end)
+    assert len(calls_by_date) == 7
+    for s, e in calls_by_date:
+        assert s == e, f"single-day call expected, got start={s} end={e}"
+    # 7 distinct dates covered
+    dates = {s for s, _ in calls_by_date}
+    assert len(dates) == 7
+    # All 7 unique announcement_links preserved
+    assert result["rows"] == 7
+    assert result["days_ok"] == 7
+    assert result["days_err"] == 0
+
+
+def test_fetch_filings_partial_day_failures_still_succeed(tmp_path, monkeypatch):
+    """If some days' fetches fail, remaining days still produce
+    parquet. days_err counter surfaces partial health."""
+    fa = _sandbox(monkeypatch, tmp_path)
+    call_count = {"n": 0}
+
+    def _flaky(**kw):
+        call_count["n"] += 1
+        # Fail every 3rd call (days 3, 6 in 1-indexed terms)
+        if call_count["n"] % 3 == 0:
+            raise RuntimeError("simulated akshare flake")
+        return pd.DataFrame([{
+            "代码": "000001", "简称": "平安银行",
+            "公告标题": f"ok{call_count['n']}",
+            "公告时间": "2026-04-23 09:00:00",
+            "公告链接": f"http://example.com/d?announcementId={call_count['n']}",
+        }])
+
+    monkeypatch.setattr(
+        fa.ak, "stock_zh_a_disclosure_report_cninfo",
+        _flaky,
+    )
+    result = fa.fetch_filings()
+    # Tenacity retries 3× per call — a day that always fails produces 3 errors
+    # that share 1 day_err bucket (the per-day except catches after retries).
+    # Of 7 days, days 3 and 6 raise after 3 retries each; 5 succeed with 1
+    # unique row each.
+    assert result["rows"] == 5
+    assert result["days_ok"] == 5
+    assert result["days_err"] == 2
