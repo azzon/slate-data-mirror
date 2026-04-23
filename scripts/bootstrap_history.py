@@ -54,6 +54,52 @@ logging.basicConfig(
 log = logging.getLogger("bootstrap")
 
 
+class _ChunkTimeout(Exception):
+    pass
+
+
+def _chunk_worker(chunk: list[str], start: str, end: str, workers: int,
+                   q) -> None:  # pragma: no cover — runs in child
+    """Child process: call tm.fetch_daily_bars, put result on queue."""
+    # Re-import in child because 'spawn' doesn't inherit module state
+    sys_path_0 = str(Path(__file__).resolve().parent)
+    import sys as _sys
+    if sys_path_0 not in _sys.path:
+        _sys.path.insert(0, sys_path_0)
+    import tencent_market as _tm  # noqa: E402 — child-local import
+    try:
+        result = _tm.fetch_daily_bars(chunk, start=start, end=end, max_workers=workers)
+        q.put(("ok", result))
+    except Exception as e:  # noqa: BLE001
+        q.put(("err", f"{type(e).__name__}: {e}"))
+
+
+def _fetch_chunk_subprocess(chunk, *, start, end, workers, timeout_s, mp_ctx):
+    """Run a chunk fetch in a child process; kill on timeout."""
+    q = mp_ctx.Queue()
+    p = mp_ctx.Process(target=_chunk_worker,
+                       args=(chunk, start, end, workers, q))
+    p.start()
+    p.join(timeout=timeout_s)
+    if p.is_alive():
+        # Terminate then kill — we don't trust a hung child to honour
+        # SIGTERM if it's deadlocked on a lock.
+        p.terminate()
+        p.join(timeout=5)
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=5)
+        raise _ChunkTimeout()
+    # Drain queue
+    try:
+        status, payload = q.get(timeout=10)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"no result from child: {e}") from e
+    if status != "ok":
+        raise RuntimeError(f"child failed: {payload}")
+    return payload
+
+
 def _load_progress() -> dict:
     if PROGRESS_FILE.exists():
         return json.loads(PROGRESS_FILE.read_text())
@@ -61,8 +107,13 @@ def _load_progress() -> dict:
 
 
 def _save_progress(p: dict) -> None:
+    """Atomic write — matches _save_status behaviour in fetch_all.py.
+    Pipeline previously got bitten by OOM mid-write leaving truncated
+    JSON which then crashed every subsequent _load_progress."""
     PROGRESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PROGRESS_FILE.write_text(json.dumps(p, ensure_ascii=False, indent=2))
+    tmp = PROGRESS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(p, ensure_ascii=False, indent=2))
+    tmp.replace(PROGRESS_FILE)
 
 
 def _market_daily_path(d: date) -> Path:
@@ -143,39 +194,37 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
             else:
                 new_df.to_parquet(path, compression="snappy", index=False)
             written += len(new_df)
+        n_dates = len(rows_by_date)
         rows_by_date.clear()
-        log.info("  flushed %d rows across %d dates", written, len(list(rows_by_date)))
+        log.info("  flushed %d rows across %d dates", written, n_dates)
 
-    # Process in CHUNK-sized ticker batches. Each batch hits Tencent
-    # via tm.fetch_daily_bars (max_workers=N internally), flushes to
-    # parquet, checkpoints progress, and pushes.
-    #
-    # Hard wall-clock timeout per chunk — if tm.fetch_daily_bars hangs
-    # (seen once: all workers stuck in futex_wait with no active
-    # sockets), we kill that chunk's subprocess and move on so the
-    # bootstrap doesn't freeze for hours.
+    # Process in CHUNK-sized ticker batches via kill-able subprocess.
+    # We saw a wedge where all threads in tm.fetch_daily_bars landed in
+    # futex_wait with no active sockets — a ThreadPoolExecutor with
+    # fut.result(timeout=...) cannot kill such a thread, and its
+    # __exit__ blocks forever on the hung thread. Subprocess can be
+    # SIGTERM/SIGKILLed cleanly, and any leaked httpx state dies with
+    # it.
     completed = 0
-    CHUNK_TIMEOUT_S = 300  # 50 tickers × 4 windows × 2s-ish ~= 400s; bound at 5 min
-    from concurrent.futures import ThreadPoolExecutor as _Executor, TimeoutError as _FTimeout
+    CHUNK_TIMEOUT_S = 300
+
+    import multiprocessing as mp
+    # 'spawn' avoids fork-inheriting httpx pool state from prior chunks.
+    mp_ctx = mp.get_context("spawn")
 
     for chunk_start in range(0, len(todo), CHUNK):
         chunk = todo[chunk_start:chunk_start + CHUNK]
         try:
-            with _Executor(max_workers=1) as ex:
-                fut = ex.submit(tm.fetch_daily_bars, chunk,
-                                start=start, end=end, max_workers=workers)
-                try:
-                    bars_by_ticker = fut.result(timeout=CHUNK_TIMEOUT_S)
-                except _FTimeout:
-                    log.error("  chunk %d-%d timed out (>%ds) — marking tickers failed",
-                              chunk_start, chunk_start + len(chunk), CHUNK_TIMEOUT_S)
-                    for t in chunk:
-                        new_failed[t] = "chunk_timeout"
-                    # Cancel the hung future; ex.__exit__ will wait for
-                    # it to drain. If it doesn't drain, we lose a worker
-                    # thread but the outer loop keeps going.
-                    fut.cancel()
-                    continue
+            bars_by_ticker = _fetch_chunk_subprocess(
+                chunk, start=start, end=end,
+                workers=workers, timeout_s=CHUNK_TIMEOUT_S, mp_ctx=mp_ctx,
+            )
+        except _ChunkTimeout:
+            log.error("  chunk %d-%d timed out (>%ds) — killed subprocess",
+                      chunk_start, chunk_start + len(chunk), CHUNK_TIMEOUT_S)
+            for t in chunk:
+                new_failed[t] = "chunk_timeout"
+            continue
         except Exception as e:  # noqa: BLE001
             log.error("  chunk %d-%d failed: %s — skipping",
                       chunk_start, chunk_start + len(chunk), e)
@@ -213,23 +262,32 @@ def bootstrap_market_daily(years: int, workers: int = 8) -> None:
                  rate, eta_min)
 
         # Flush + checkpoint + push after every chunk.
+        # failed_codes: merge with prior so tickers that failed on
+        # *earlier* runs aren't forgotten when this run skipped them.
         flush_chunk()
         done.update(new_done)
+        merged_failed = {**failed_prior, **new_failed}
+        # Remove any ticker that now succeeded
+        for t in new_done:
+            merged_failed.pop(t, None)
         progress["market_daily"]["done_codes"] = sorted(done)
-        progress["market_daily"]["failed_codes"] = new_failed
+        progress["market_daily"]["failed_codes"] = merged_failed
         progress["market_daily"]["last_checkpoint"] = datetime.now(timezone.utc).isoformat()
         _save_progress(progress)
         _git_push(
             f"bootstrap(market_daily): +{processed_in_chunk} ok, "
-            f"{len(new_failed)} fail ({len(done)}/{len(all_tickers)} total)"
+            f"{len(merged_failed)} fail total ({len(done)}/{len(all_tickers)} total)"
         )
         processed_in_chunk = 0
 
     # Final flush (safety — chunk loop flushes every iter).
     flush_chunk()
     done.update(new_done)
+    merged_failed = {**failed_prior, **new_failed}
+    for t in new_done:
+        merged_failed.pop(t, None)
     progress["market_daily"]["done_codes"] = sorted(done)
-    progress["market_daily"]["failed_codes"] = new_failed
+    progress["market_daily"]["failed_codes"] = merged_failed
     progress["market_daily"]["completed_at"] = datetime.now(timezone.utc).isoformat()
     _save_progress(progress)
     total_mins = (time.time() - started) / 60

@@ -23,10 +23,14 @@ RUNNER_SVC="actions.runner.azzon-slate-data-mirror.aliyun-cn-runner.service"
 
 echo "==> runner systemd drop-in: memory cap + restart policy"
 install -d -m 755 /etc/systemd/system/"$RUNNER_SVC".d
+# Box has 1.6 GB RAM. Reserve ~100M for sshd + systemd + kernel. Runner
+# peak (pip install pandas+pyarrow + bootstrap chunk with 200MB pandas
+# frames) lands near 1.3G so give 1.5G hard cap + 1.3G soft throttle.
+# Previous 1200M was too tight — pip install tripped it silently.
 cat > /etc/systemd/system/"$RUNNER_SVC".d/10-harden.conf <<'EOF'
 [Service]
-MemoryMax=1200M
-MemoryHigh=1000M
+MemoryMax=1500M
+MemoryHigh=1300M
 Restart=always
 RestartSec=10
 StartLimitBurst=10

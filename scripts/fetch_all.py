@@ -52,6 +52,7 @@ import tencent_market as tm  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
 STATUS_FILE = DATA_DIR / "_status.json"
+PERMAFAIL_FILE = DATA_DIR / "_market_daily_permafail.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,7 +121,30 @@ def _market_daily_path(d: date) -> Path:
     return DATA_DIR / "market_daily" / f"{d.year}" / f"{d.month:02d}" / f"{d.isoformat()}.parquet"
 
 
+def _load_market_daily_permafail() -> set[str]:
+    if not PERMAFAIL_FILE.exists():
+        return set()
+    try:
+        return set(json.loads(PERMAFAIL_FILE.read_text()))
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _save_market_daily_permafail(dates: set[str]) -> None:
+    """Atomically persist the set of dates the upstream source has
+    permanently refused data for (e.g. holidays > 30 days old that
+    Tencent's qfqday window no longer returns). Prevents the gap scan
+    from re-attempting them every 4h forever."""
+    PERMAFAIL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = PERMAFAIL_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sorted(dates), ensure_ascii=False))
+    tmp.replace(PERMAFAIL_FILE)
+
+
 # ── per-endpoint fetchers ───────────────────────────────────────────────
+
+
+SECURITIES_FLOOR = 4500  # A-share market has ~5500; <4500 means a prefix range failed
 
 
 def fetch_securities() -> dict:
@@ -129,21 +153,38 @@ def fetch_securities() -> dict:
     Prefer Tencent universe probe (same source that seeds market_daily so
     we never get (ticker, trade_date) rows for a ticker missing from
     securities). Falls back to akshare if Tencent is down.
+
+    Refuses to overwrite the existing file with a partial (< SECURITIES_FLOOR)
+    result — a Tencent prefix-batch failure shouldn't clobber a healthy
+    reference table.
     """
+    chosen_df: pd.DataFrame | None = None
+    source = None
     try:
         universe = tm.fetch_universe()
-        if universe:
-            df = pd.DataFrame([
+        if universe and len(universe) >= SECURITIES_FLOOR:
+            chosen_df = pd.DataFrame([
                 {"code": u["ticker"].split(".")[0], "name": u["name"]}
                 for u in universe
             ])
-            kb = _write_parquet(df, "securities/latest.parquet")
-            return {"rows": len(df), "size_kb": kb, "source": "tencent"}
+            source = "tencent"
+        elif universe:
+            log.warning("  tencent universe only %d rows (< %d floor) — falling back",
+                        len(universe), SECURITIES_FLOOR)
     except Exception as e:  # noqa: BLE001
         log.warning("  tencent universe failed (%s) — falling back to akshare", e)
-    df = _ak_call(ak.stock_info_a_code_name)
-    kb = _write_parquet(df, "securities/latest.parquet")
-    return {"rows": len(df), "size_kb": kb, "source": "akshare"}
+
+    if chosen_df is None:
+        df = _ak_call(ak.stock_info_a_code_name)
+        if df is None or len(df) < SECURITIES_FLOOR:
+            raise RuntimeError(
+                f"both sources returned < {SECURITIES_FLOOR} rows — refusing to clobber"
+            )
+        chosen_df = df
+        source = "akshare"
+
+    kb = _write_parquet(chosen_df, "securities/latest.parquet")
+    return {"rows": len(chosen_df), "size_kb": kb, "source": source}
 
 
 def _fetch_one_day_bars(d: date) -> pd.DataFrame | None:
@@ -186,6 +227,68 @@ def _is_trading_day(d: date) -> bool:
     return d.weekday() < 5
 
 
+def _recent_row_median(today: date, *, window_days: int = 30) -> int:
+    """Median tickers/day in recent parquets. Used as the adaptive
+    floor — a hard-coded ROW_COUNT_FLOOR misbehaves on half-day sessions
+    and pre-2020 history where the universe was smaller.
+
+    Returns 0 if we can't sample (fresh clone). Caller should combine
+    with a sane ABSOLUTE minimum so the first file written doesn't
+    lock itself out.
+    """
+    counts: list[int] = []
+    back = 1
+    sampled = 0
+    # Look back further to find enough samples
+    while sampled < 10 and back <= 180:
+        d = today - timedelta(days=back)
+        back += 1
+        if not _is_trading_day(d):
+            continue
+        p = _market_daily_path(d)
+        if not p.exists():
+            continue
+        try:
+            counts.append(len(pd.read_parquet(p)))
+            sampled += 1
+        except Exception:  # noqa: BLE001
+            continue
+    if not counts:
+        return 0
+    return sorted(counts)[len(counts) // 2]
+
+
+def _merge_market_daily(df: pd.DataFrame, d: date) -> int:
+    """Write `df` to today's parquet, merging with any existing file.
+
+    We NEVER overwrite an existing per-day file wholesale — if Tencent
+    returned a partial universe for any reason (CDN hiccup, network
+    flake), the new frame is concat'd with the existing and deduped
+    on ticker, keeping the larger set. Returns total rows written.
+    """
+    path = _market_daily_path(d)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            prior = pd.read_parquet(path)
+            merged = pd.concat([prior, df], ignore_index=True)
+            # Prefer prior rows for same (ticker, trade_date) only when
+            # the new row is missing close — otherwise the fresh fetch
+            # wins (it's more recent).
+            merged = merged.drop_duplicates(subset=["ticker", "trade_date"], keep="last")
+            merged.to_parquet(path, compression="snappy", index=False)
+            log.info("  merged %s (prior=%d, new=%d, total=%d)",
+                     d, len(prior), len(df), len(merged))
+            return len(merged)
+        except Exception as e:  # noqa: BLE001
+            log.warning("  merge read failed for %s (%s) — writing fresh", d, e)
+    df.to_parquet(path, compression="snappy", index=False)
+    log.info("  wrote %s (rows=%d, %dKB)",
+             path.relative_to(DATA_DIR.parent),
+             len(df), path.stat().st_size // 1024)
+    return len(df)
+
+
 def fetch_market_daily() -> dict:
     """Append today's OHLCV (post-close) + backfill any missing trading day.
 
@@ -195,9 +298,9 @@ def fetch_market_daily() -> dict:
     2. Scan the full history window (default 5 years) for any trading day
        whose parquet is missing and backfill it. Capped at MAX_GAP_FILL per
        run so a long outage doesn't produce an 8-hour workflow.
-    3. Trust but verify: files below ROW_COUNT_FLOOR are treated as
-       partial/broken and re-fetched (catches cases where a previous run
-       crashed mid-write).
+    3. Re-fetch files whose row count is < 0.5 × recent-median. Caught
+       partial writes without over-reacting on genuinely thin days (half-
+       day sessions, early history).
 
     We budget a bounded number of gap fills per run. A runner-lost-comms
     incident that leaves 30 days unfilled won't monopolise one workflow
@@ -207,7 +310,11 @@ def fetch_market_daily() -> dict:
     now = datetime.now(CST)
     MAX_GAP_FILL = int(os.environ.get("MIRROR_MAX_GAP_FILL", "20"))
     HISTORY_DAYS = int(os.environ.get("MIRROR_HISTORY_DAYS", str(365 * 5 + 1)))
-    ROW_COUNT_FLOOR = int(os.environ.get("MIRROR_DAILY_ROW_FLOOR", "1000"))
+
+    # Adaptive floor: half of the recent median ticker count, or 500 as
+    # an absolute minimum on fresh clones where no median exists.
+    recent_median = _recent_row_median(today)
+    floor = max(500, int(recent_median * 0.5)) if recent_median else 500
 
     pending: list[date] = []
 
@@ -216,24 +323,28 @@ def fetch_market_daily() -> dict:
         if not _market_daily_path(today).exists():
             pending.append(today)
 
-    # Full-history gap scan (bounded)
+    # Full-history gap scan (bounded, with permanent-fail memory)
+    permafail = _load_market_daily_permafail()
+    skipped_permafail = 0
     for back in range(1, HISTORY_DAYS + 1):
         d = today - timedelta(days=back)
         if not _is_trading_day(d):
+            continue
+        d_iso = d.isoformat()
+        if d_iso in permafail:
+            skipped_permafail += 1
             continue
         path = _market_daily_path(d)
         if not path.exists():
             pending.append(d)
         else:
-            # Detect partial writes (a previous run crashed mid-dump).
-            # Reading size is cheap; reading row count needs a parquet
-            # read. File-size < 40KB is ~40 rows — definitely broken.
+            # Detect partial writes using adaptive floor
             try:
                 if path.stat().st_size < 40_000:
-                    # Verify row count rather than trusting just size
                     n = len(pd.read_parquet(path))
-                    if n < ROW_COUNT_FLOOR:
-                        log.info("  refilling partial %s (%d rows)", d, n)
+                    if n < floor:
+                        log.info("  refilling partial %s (%d rows < %d floor)",
+                                 d, n, floor)
                         pending.append(d)
             except Exception:  # noqa: BLE001
                 pending.append(d)
@@ -241,25 +352,43 @@ def fetch_market_daily() -> dict:
             break
 
     if not pending:
-        return {"rows": 0, "note": "no pending dates (all trading days in window present)"}
+        note = "no pending dates"
+        if skipped_permafail:
+            note += f" ({skipped_permafail} permafail skipped)"
+        return {"rows": 0, "note": note, "no_work": True}
 
     pending.sort(reverse=True)
-    log.info("  market_daily pending dates: %d (showing first 5: %s)",
-             len(pending), [d.isoformat() for d in pending[:5]])
+    log.info("  market_daily pending: %d (sample: %s), floor=%d",
+             len(pending), [d.isoformat() for d in pending[:5]], floor)
 
     total_rows = 0
     filled = []
+    new_permafails: list[str] = []
     for d in pending:
         log.info("  fetching market_daily for %s", d)
         df = _fetch_one_day_bars(d)
         if df is None or df.empty:
+            # Permanently record this date as "source has no data here"
+            # so we don't keep pounding it every run. Trading-day holidays
+            # past 30 days never materialise so treat them as permafail.
+            if (today - d).days > 30:
+                new_permafails.append(d.isoformat())
             log.info("    (no data — likely holiday or pre-publish)")
             continue
         df["trade_date"] = d.isoformat()
-        path_rel = f"market_daily/{d.year}/{d.month:02d}/{d.isoformat()}.parquet"
-        _write_parquet(df, path_rel)
-        total_rows += len(df)
+        # Sanity: if upstream returned fewer rows than half the recent
+        # median, do NOT write — we'd corrupt otherwise-healthy data on
+        # transient CDN issues. Let the next 4h run retry.
+        if recent_median and len(df) < max(500, int(recent_median * 0.5)):
+            log.warning("  rejected %s: only %d rows (median=%d); retry next run",
+                        d, len(df), recent_median)
+            continue
+        rows_written = _merge_market_daily(df, d)
+        total_rows += rows_written
         filled.append(d.isoformat())
+
+    if new_permafails:
+        _save_market_daily_permafail(permafail | set(new_permafails))
 
     return {
         "rows": total_rows,
@@ -272,22 +401,33 @@ def fetch_market_daily() -> dict:
 def _per_ticker_serial(codes: list[str], fetch_one: Callable[[str], pd.DataFrame | None], *, label: str) -> pd.DataFrame:
     """Single-threaded per-ticker loop with AKSHARE_SLEEP throttle.
 
-    We used ThreadPoolExecutor at 4-6 workers originally. After seeing a
-    full-universe Eastmoney IP ban during a bulk run we reverted to
-    strict serial: fewer requests per unit time *is* the point. 5500
-    tickers × 1.5s ≈ 2.3h. Ample, and ban-proof.
+    Strict serial: fewer requests per unit time *is* the point after
+    the Eastmoney IP ban of 2026-04 taught us that. 5500 × 1.5s ≈ 2.3h.
+    Records failures with exception class at DEBUG level so a post-run
+    investigation can tell what failed.
     """
     rows: list[pd.DataFrame] = []
+    failed_samples: list[str] = []
     failed = 0
     for i, code in enumerate(codes, 1):
         try:
             out = fetch_one(code)
             if out is not None and not out.empty:
                 rows.append(out)
-        except Exception:  # noqa: BLE001
+            elif out is None or out.empty:
+                # not an exception, just no data for this ticker
+                pass
+        except Exception as e:  # noqa: BLE001
             failed += 1
+            if len(failed_samples) < 10:
+                failed_samples.append(f"{code}:{type(e).__name__}")
+            log.debug("  %s failed %s: %s", label, code, e)
         if i % 200 == 0:
-            log.info("  %s %d/%d (%d failed)", label, i, len(codes), failed)
+            log.info("  %s %d/%d (%d failed, samples=%s)",
+                     label, i, len(codes), failed, failed_samples[:3])
+    if failed:
+        log.warning("  %s total failures: %d (first 10: %s)",
+                    label, failed, failed_samples)
     if not rows:
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
@@ -376,21 +516,21 @@ def fetch_shareholders() -> dict:
 
 def fetch_yjyg() -> dict:
     today = _today_cn()
-    # last 4 quarter-ends
+    # Last 4 CLOSED quarter-ends. A quarter-end on or equal to today is
+    # not yet reported; start from the most recent strictly-past one.
     quarters = []
     y, m = today.year, today.month
     q_end_months = [3, 6, 9, 12]
     for _ in range(4):
-        qm = max([qm for qm in q_end_months if qm <= m], default=None)
-        if qm is None:
+        # Find largest quarter-end strictly before today (m-1 so March
+        # doesn't pretend 2026-03-31 is closed)
+        candidates = [qm for qm in q_end_months if qm < m] or q_end_months
+        qm = max(candidates)
+        if qm >= m:  # rolled back to previous year
             y -= 1
-            qm = 12
         last_day = {3: 31, 6: 30, 9: 30, 12: 31}[qm]
         quarters.append(f"{y}{qm:02d}{last_day:02d}")
-        m = qm - 1
-        if m < 1:
-            y -= 1
-            m = 12
+        m = qm  # next iter finds the quarter-end before this one
     frames = []
     for q in quarters:
         try:
@@ -548,7 +688,7 @@ ENDPOINTS: list[Endpoint] = [
     Endpoint("lhb",           cadence_h=20, fetcher=fetch_lhb),
     Endpoint("yjyg",          cadence_h=20, fetcher=fetch_yjyg),
     Endpoint("margin",        cadence_h=20, fetcher=fetch_margin),
-    Endpoint("research",      cadence_h=20, fetcher=fetch_research),
+    # research is per-ticker 5500× serial ≈ 2.3h — weekly only
     # Weekly (quarterly-paced data + per-ticker loops):
     Endpoint("financials",    cadence_h=24 * 7, fetcher=fetch_financials, tags=["slow"]),
     Endpoint("shareholders",  cadence_h=24 * 7, fetcher=fetch_shareholders),
@@ -568,44 +708,83 @@ def _load_status() -> dict:
 
 
 def _save_status(status: dict) -> None:
+    """Atomically persist _status.json.
+
+    Previous version did a direct write_text which, if the process is
+    OOM-killed mid-write, leaves a truncated JSON that every later
+    _load_status() crashes on. Write to .tmp then os.replace.
+    """
     status["updated_at"] = datetime.now(timezone.utc).isoformat()
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATUS_FILE.write_text(json.dumps(status, ensure_ascii=False, indent=2))
+    tmp = STATUS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(status, ensure_ascii=False, indent=2))
+    tmp.replace(STATUS_FILE)
 
 
 def _is_due(ep: Endpoint, status: dict, *, force: bool) -> bool:
+    """Cadence gate based on `last_attempt` (not last_success).
+
+    Using last_attempt avoids the classic masking bug: a 'healthy no-op'
+    that updates last_success would block re-runs for the full cadence
+    even though nothing was fetched. last_attempt is always refreshed —
+    so a no-work pass still counts for scheduling, but health signals
+    (fail_streak, last_error) surface stalls.
+    """
     if force:
         return True
     ep_status = status["endpoints"].get(ep.name, {})
-    last_ok = ep_status.get("last_success")
-    if not last_ok:
+    # Prefer last_attempt; fall back to last_success for rows written by
+    # older versions of this script before last_attempt existed.
+    last_ts = ep_status.get("last_attempt") or ep_status.get("last_success")
+    if not last_ts:
         return True
     try:
-        last_dt = datetime.fromisoformat(last_ok)
+        last_dt = datetime.fromisoformat(last_ts)
     except ValueError:
         return True
     age_h = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
     return age_h >= ep.cadence_h
 
 
-def _git_push_incremental(ep_name: str, meta: dict) -> None:
+def _git_push_incremental(ep_name: str, meta: dict) -> bool:
+    """Commit + push this endpoint's diff. Returns True on success.
+
+    Performs git pull --rebase --autostash before push so a concurrent
+    writer (another workflow or a human commit) doesn't force-fail us
+    with non-fast-forward. On failure the caller should clear the
+    endpoint's last_success so cadence will retry on next run rather
+    than waiting out the normal cycle.
+    """
     def run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(args, cwd=REPO_ROOT, check=check, text=True, capture_output=True)
     try:
         run("git", "add", "data/")
         if run("git", "diff", "--cached", "--quiet", check=False).returncode == 0:
             log.info("  (no diff to commit for %s)", ep_name)
-            return
+            return True
         rows = meta.get("rows", meta.get("boards", meta.get("members", "?")))
         extra = ""
         if meta.get("filled_dates"):
             extra = f" [filled: {','.join(meta['filled_dates'][:5])}{'...' if len(meta['filled_dates']) > 5 else ''}]"
         run("git", "commit", "-m", f"data({ep_name}): {rows} rows{extra}")
-        run("git", "push", "origin", "HEAD:main")
+        # Pull-rebase-autostash — accounts for two workflows writing
+        # concurrently, or for a human making a repo-level commit.
+        pull = run("git", "pull", "--rebase", "--autostash", "origin", "main", check=False)
+        if pull.returncode != 0:
+            log.warning("  pull --rebase failed for %s: %s", ep_name,
+                        (pull.stderr or pull.stdout or "").strip()[-200:])
+            return False
+        push = run("git", "push", "origin", "HEAD:main", check=False)
+        if push.returncode != 0:
+            log.warning("  push failed for %s: %s", ep_name,
+                        (push.stderr or push.stdout or "").strip()[-200:])
+            return False
         log.info("  pushed %s", ep_name)
+        return True
     except subprocess.CalledProcessError as e:
-        log.warning("  push failed for %s: %s — will retry on next endpoint", ep_name,
+        log.warning("  git op failed for %s: %s", ep_name,
                     (e.stderr or e.stdout or "").strip()[-200:])
+        return False
 
 
 def run_once(*, only: list[str] | None, force: bool, incremental_push: bool) -> int:
@@ -622,26 +801,49 @@ def run_once(*, only: list[str] | None, force: bool, incremental_push: bool) -> 
             continue
         log.info("── %s ──", ep.name)
         ep_started = time.time()
+        prior = status["endpoints"].get(ep.name, {})
         try:
             meta = ep.fetcher()
             elapsed = time.time() - ep_started
+            # Health semantics:
+            #  last_attempt  — always updated (cadence gate reads this)
+            #  last_success  — only updated when meta actually produced data
+            #  fail_streak   — incremented on no-data attempts too, so a
+            #                  gate-blocked market_daily (pre-close 16:00)
+            #                  doesn't look "healthy" forever.
+            now_iso = datetime.now(timezone.utc).isoformat()
+            produced_data = meta.get("rows", 0) > 0 or bool(meta.get("filled_dates"))
+            # Some endpoints legitimately have no-work passes (gap-heal when
+            # everything is already present) — mark them with no_work=True
+            # in their return meta to opt out of fail_streak.
+            no_work = bool(meta.get("no_work"))
+            new_streak = 0 if produced_data or no_work else prior.get("fail_streak", 0) + 1
             status["endpoints"][ep.name] = {
-                "last_success": datetime.now(timezone.utc).isoformat(),
+                **prior,
+                "last_attempt": now_iso,
                 "last_elapsed_s": round(elapsed, 1),
                 "last_meta": meta,
                 "last_error": None,
-                "fail_streak": 0,
+                "fail_streak": new_streak,
             }
+            if produced_data or no_work:
+                status["endpoints"][ep.name]["last_success"] = now_iso
             succeeded += 1
-            log.info("  ✓ %s (%.1fs)", ep.name, elapsed)
+            log.info("  ✓ %s (%.1fs, rows=%s, streak=%d)",
+                     ep.name, elapsed, meta.get("rows", "?"), new_streak)
             _save_status(status)
             if incremental_push:
-                _git_push_incremental(ep.name, meta)
+                pushed = _git_push_incremental(ep.name, meta)
+                if not pushed:
+                    # Roll back last_success so cadence re-tries next run
+                    status["endpoints"][ep.name]["last_success"] = prior.get("last_success")
+                    status["endpoints"][ep.name]["last_push_error"] = now_iso
+                    _save_status(status)
         except Exception as e:  # noqa: BLE001
             failed += 1
-            prior = status["endpoints"].get(ep.name, {})
             status["endpoints"][ep.name] = {
                 **prior,
+                "last_attempt": datetime.now(timezone.utc).isoformat(),
                 "last_error": f"{type(e).__name__}: {e}",
                 "last_error_at": datetime.now(timezone.utc).isoformat(),
                 "fail_streak": prior.get("fail_streak", 0) + 1,

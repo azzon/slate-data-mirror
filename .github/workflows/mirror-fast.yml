@@ -1,7 +1,8 @@
 name: Mirror fast endpoints
 
 # Lightweight endpoints: securities, macro, north_flow, lhb, yjyg,
-# margin, research, news. Each is a single API call (or very few).
+# margin, news. Each is a single API call (or very few).
+# research is per-ticker (5500×) and lives in mirror-slow.yml.
 # Safe to run every few hours without triggering any rate-limits.
 #
 # CN cron: 06:00 / 10:00 / 14:00 / 18:00 / 22:00

@@ -81,27 +81,16 @@ jobs:
           if [ "$CRON" = "0 19 * * 6" ]; then
             echo "run=yes" >> "$GITHUB_OUTPUT"; echo "reason=primary"; exit 0
           fi
-          # Retry cron — check freshness
-          if [ ! -f data/_status.json ]; then
-            echo "run=yes" >> "$GITHUB_OUTPUT"; echo "reason=no status file"; exit 0
-          fi
-          last_ok=$(python3 -c "
-          import json, sys
-          from datetime import datetime, timezone, timedelta
-          s = json.load(open('data/_status.json'))
-          ep = s.get('endpoints', {}).get('financials', {})
-          t = ep.get('last_success')
-          if not t:
-              print('none'); sys.exit(0)
-          age_d = (datetime.now(timezone.utc) - datetime.fromisoformat(t)).total_seconds() / 86400
-          print(f'{age_d:.1f}')
-          ")
-          echo "financials age days: $last_ok"
-          if [ "$last_ok" = "none" ] || [ "$(echo "$last_ok > 6" | bc -l 2>/dev/null || echo 1)" = "1" ]; then
-            echo "run=yes" >> "$GITHUB_OUTPUT"; echo "reason=stale ($last_ok days)"
-          else
-            echo "run=no" >> "$GITHUB_OUTPUT"; echo "reason=fresh ($last_ok days)"
-          fi
+          # Retry cron — delegate to scripts/slow_decide.py so we avoid
+          # YAML heredoc-indentation pitfalls. Emits `run=yes|no reason=...`
+          decision=$(python3 scripts/slow_decide.py)
+          echo "decision: $decision"
+          for kv in $decision; do
+              key=${kv%%=*}; val=${kv#*=}
+              if [ "$key" = "run" ]; then
+                  echo "run=$val" >> "$GITHUB_OUTPUT"
+              fi
+          done
 
       - name: Fetch slow endpoints
         if: steps.decide.outputs.run == 'yes'
