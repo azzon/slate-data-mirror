@@ -65,3 +65,46 @@ jobs:
                               --label mirror-health \
                               --body "$body"
           fi
+
+      # Wave 13 — auto-heal: parse alert output and kick off a retry
+      # workflow for the stale endpoint. Rate-limited to avoid infinite
+      # re-trigger loops; the retry itself writes _status.json so next
+      # healthcheck sees fresh data.
+      - name: Auto-trigger endpoint retry
+        if: steps.analyze.outputs.has_alert == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Extract stale endpoint names from the healthcheck output.
+          # healthcheck.py emits lines like:
+          #   ALERT concepts: stale 32h (cadence 168h)
+          stale_names=$(grep '^ALERT' /tmp/hc.out | awk '{print $2}' | tr -d ':' | sort -u | tr '\n' ',' | sed 's/,$//')
+          if [ -z "$stale_names" ]; then
+              echo "no stale endpoint names parsed; skipping auto-retry"
+              exit 0
+          fi
+          # Don't auto-retry more than once per healthcheck (8h apart
+          # anyway). The retry workflow commits _status.json — if the
+          # retry also failed, the next healthcheck will surface a new
+          # alert, but no loop.
+          fast_endpoints="securities,macro,filings,north_flow,lhb,yjyg,margin,news"
+          slow_endpoints="financials,shareholders,concepts,industries,research"
+          to_retry_fast=""
+          to_retry_slow=""
+          for ep in $(echo "$stale_names" | tr ',' ' '); do
+              if echo "$fast_endpoints" | grep -q "\b$ep\b"; then
+                  to_retry_fast="$to_retry_fast,$ep"
+              elif echo "$slow_endpoints" | grep -q "\b$ep\b"; then
+                  to_retry_slow="$to_retry_slow,$ep"
+              fi
+          done
+          to_retry_fast=$(echo "$to_retry_fast" | sed 's/^,//')
+          to_retry_slow=$(echo "$to_retry_slow" | sed 's/^,//')
+          if [ -n "$to_retry_fast" ]; then
+              echo "Auto-retrying fast endpoints: $to_retry_fast"
+              gh workflow run mirror-fast.yml --field only="$to_retry_fast" --field force=true
+          fi
+          if [ -n "$to_retry_slow" ]; then
+              echo "Auto-retrying slow endpoints: $to_retry_slow"
+              gh workflow run mirror-slow.yml --field only="$to_retry_slow"
+          fi

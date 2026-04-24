@@ -79,8 +79,17 @@ def _today_cn() -> date:
     return datetime.now(CST).date()
 
 
-def _retry(fn: Callable, *args, tries: int = 3, base_delay: float = 5.0, **kw):
-    """Exponential backoff for transient upstream errors."""
+def _retry(fn: Callable, *args, tries: int = 5, base_delay: float = 5.0, **kw):
+    """Exponential backoff for transient upstream errors.
+
+    Wave 13: tries 3→5. Mirror-slow audit showed concepts/industries
+    at ~25% success rate due to RemoteDisconnected mid-sweep; 3 retries
+    in a 3+9+27s window weren't enough to ride through upstream's
+    60-90s mini-outages (common from ~19:30 UTC = 03:30 CST peak).
+    5 retries with 3^n × 5s = 5s / 15s / 45s / 135s / 405s ≈ 10 min
+    of total retry window. If upstream is dead for 10+ min, that's a
+    real incident and failing fast is correct.
+    """
     last = None
     for attempt in range(1, tries + 1):
         try:
@@ -103,9 +112,9 @@ AKSHARE_SLEEP = float(os.environ.get("MIRROR_AKSHARE_SLEEP", "1.5"))
 
 
 def _ak_call(fn: Callable, *args, **kw):
-    """Retry-wrapped AKShare call with built-in throttle."""
+    """Retry-wrapped AKShare call with built-in throttle. tries=5 post-W13."""
     time.sleep(AKSHARE_SLEEP)
-    return _retry(fn, *args, tries=3, base_delay=10.0, **kw)
+    return _retry(fn, *args, tries=5, base_delay=10.0, **kw)
 
 
 def _write_parquet(df: pd.DataFrame, rel: str) -> int:
@@ -1262,33 +1271,49 @@ def _git_push_all() -> bool:
     """Batched push of every local commit from this pass.
 
     Pulls --rebase --autostash first so a concurrent writer (another
-    workflow or human commit) doesn't force-fail us. Returns True on
-    success, False otherwise.
+    workflow or human commit) doesn't force-fail us. Wave 13: retries
+    the pull+push cycle up to 3 times with backoff, since concurrent
+    workflow runs (fast + slow + backfill) all push to main through
+    the same runner; a mid-push race can look like `failed to push
+    some refs (non-fast-forward)` which fixes itself on a repeat.
+
+    Returns True on success, False otherwise.
     """
     def run(*args: str, check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(args, cwd=REPO_ROOT, check=check, text=True, capture_output=True)
-    try:
-        # Nothing to push? Skip fast.
-        ahead = run("git", "rev-list", "--count", "@{upstream}..HEAD", check=False)
-        if ahead.returncode == 0 and ahead.stdout.strip() == "0":
-            log.info("  (no commits to push)")
-            return True
-        pull = run("git", "pull", "--rebase", "--autostash", "origin", "main", check=False)
-        if pull.returncode != 0:
-            log.warning("  pull --rebase failed: %s",
-                        (pull.stderr or pull.stdout or "").strip()[-200:])
-            return False
-        push = run("git", "push", "origin", "HEAD:main", check=False)
-        if push.returncode != 0:
-            log.warning("  push failed: %s",
-                        (push.stderr or push.stdout or "").strip()[-200:])
-            return False
-        log.info("  batched push successful")
+    # Nothing to push? Skip fast.
+    ahead = run("git", "rev-list", "--count", "@{upstream}..HEAD", check=False)
+    if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+        log.info("  (no commits to push)")
         return True
-    except subprocess.CalledProcessError as e:
-        log.warning("  git op failed: %s",
-                    (e.stderr or e.stdout or "").strip()[-200:])
-        return False
+    for attempt in range(1, 4):
+        try:
+            pull = run("git", "pull", "--rebase", "--autostash", "origin", "main", check=False)
+            if pull.returncode != 0:
+                log.warning("  pull --rebase failed (try %d/3): %s", attempt,
+                            (pull.stderr or pull.stdout or "").strip()[-200:])
+                if attempt < 3:
+                    time.sleep(5 * attempt)
+                    continue
+                return False
+            push = run("git", "push", "origin", "HEAD:main", check=False)
+            if push.returncode != 0:
+                log.warning("  push failed (try %d/3): %s", attempt,
+                            (push.stderr or push.stdout or "").strip()[-200:])
+                if attempt < 3:
+                    time.sleep(5 * attempt)
+                    continue
+                return False
+            log.info("  batched push successful (try %d)", attempt)
+            return True
+        except subprocess.CalledProcessError as e:
+            log.warning("  git op failed (try %d/3): %s", attempt,
+                        (e.stderr or e.stdout or "").strip()[-200:])
+            if attempt < 3:
+                time.sleep(5 * attempt)
+                continue
+            return False
+    return False
 
 
 def run_once(*, only: list[str] | None, force: bool, incremental_push: bool) -> int:
