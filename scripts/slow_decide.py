@@ -39,10 +39,20 @@ STATUS = Path("data/_status.json")
 # anchor_endpoint → (endpoints_to_run, human_label, stale_threshold_days).
 # Daily anchors use a 1-day stale threshold; weekly anchors use 6 days
 # (allowing a primary cron to have fired plus one day of slack).
+#
+# concepts + industries are intentionally omitted from the retry-cron
+# rotation: Eastmoney's 79.push2 endpoint consistently RemoteDisconnects
+# on the ECS runner IP (classic IP-category block for
+# financial-aggregator endpoints — we hit the same pattern before on
+# stock_zh_a_hist before switching to Tencent gtimg). Slate doesn't
+# actually consume concepts/industries parquets today, so keeping them
+# in the retry queue just wastes 2-3× daily cron slots on a guaranteed
+# failure. The Friday primary cron still attempts them once/week, which
+# is fine if Eastmoney later unblocks the IP. If you want to re-enable
+# the retry, add ("concepts", "concepts,industries", ..., 6.0) back.
 CHUNKS = [
     ("financials",   "financials",            "financials",          1.1),
     ("research",     "research",              "research",            6.0),
-    ("concepts",     "concepts,industries",   "concepts+industries", 6.0),
     ("shareholders", "shareholders",          "shareholders",        6.0),
 ]
 
