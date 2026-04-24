@@ -1050,11 +1050,32 @@ def fetch_filings() -> dict:
                 ),
                 tries=3,
             )
+        except KeyError as e:
+            # akshare's column-rename fails on empty responses
+            # (non-trading days: weekends, holidays). Not a real error
+            # — write an empty marker parquet so we don't retry every
+            # cron forever. Don't count against per_day_err.
+            msg = str(e)
+            if "代码" in msg or "announcementId" in msg:
+                log.info("  filings %s non-trading day (empty response)", ds)
+                pd.DataFrame(
+                    columns=["代码", "简称", "公告标题", "公告时间",
+                             "公告链接", "mirror_fetch_date"]
+                ).to_parquet(day_parquet, compression="zstd", index=False)
+                continue
+            log.warning("  filings %s fetch failed: %s", ds, e)
+            per_day_err += 1
+            continue
         except Exception as e:  # noqa: BLE001
             log.warning("  filings %s fetch failed: %s", ds, e)
             per_day_err += 1
             continue
         if df_day is None or df_day.empty:
+            # Empty response — also write marker (non-trading day).
+            pd.DataFrame(
+                columns=["代码", "简称", "公告标题", "公告时间",
+                         "公告链接", "mirror_fetch_date"]
+            ).to_parquet(day_parquet, compression="zstd", index=False)
             continue
         # Per-day dedup before writing (cninfo pagination overlaps).
         url_col = "公告链接" if "公告链接" in df_day.columns else "announcement_url"

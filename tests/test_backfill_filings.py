@@ -151,13 +151,18 @@ def test_backfill_handles_upstream_schema_gap(tmp_path, monkeypatch):
                      batch_days=100, max_errors=3)
     assert rc == 0, "schema gaps must not trip max_errors"
 
-    # Days after 04-10 should be written
+    # Days after 04-10 should be written with real data
     history = tmp_path / "data" / "filings" / "history"
     files = sorted(p.stem for p in history.glob("*.parquet"))
     assert "2026-04-10" in files
     assert "2026-04-15" in files
-    # Days before 04-10 should NOT be written
-    assert "2026-04-01" not in files
+    # W12 gap days are written as EMPTY markers (so cache-skip applies
+    # across fetch_filings + backfill). Check they exist but are empty.
+    assert "2026-04-01" in files
+    empty_marker = pd.read_parquet(history / "2026-04-01.parquet")
+    assert empty_marker.empty
+    real = pd.read_parquet(history / "2026-04-10.parquet")
+    assert not real.empty
 
     # Schema gap file should record the gap dates
     gap_file = tmp_path / "data" / "_filings_schema_gap.json"

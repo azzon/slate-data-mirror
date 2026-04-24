@@ -88,15 +88,18 @@ def _save_progress(p: dict) -> None:
 
 
 class UpstreamSchemaGap(Exception):
-    """akshare's column-rename fails on historical dates (pre ~2021-11-22).
-    Signals 'upstream has no data for this date' rather than 'transient
-    error'. Backfill treats this as a permanent gap, not a counted error."""
+    """Wave 11: akshare's column-rename fails on historical dates pre
+    ~2021-11-22.
+    Wave 12: same KeyError is ALSO fired on empty responses (weekends,
+    holidays) — rewire to treat both as 'no data for this date' and
+    write an empty marker parquet. Not a counted error."""
 
 
 def _fetch_one_day(d: date) -> pd.DataFrame | None:
     """Single-day cninfo call with retry. Returns None on transient
     failure (counts toward max_errors). Raises UpstreamSchemaGap when
-    the date is pre-akshare-schema (permanent gap, doesn't retry)."""
+    akshare's internal column-rename fails (non-trading day OR pre-
+    akshare-schema historical date — both permanent)."""
     ds = d.strftime("%Y%m%d")
     last_err = None
     for attempt in range(3):
@@ -111,12 +114,13 @@ def _fetch_one_day(d: date) -> pd.DataFrame | None:
             )
             return df
         except KeyError as e:
-            # akshare's df[[...]] column lookup on pre-rename cninfo
-            # response. Permanent — date is before their normaliser
-            # was written. Don't retry.
+            # Either: (a) non-trading day — akshare column-renames an
+            # empty response, throws KeyError. (b) pre-2021 historical
+            # — akshare's parser never supported those.
+            # Both permanent — don't retry.
             msg = str(e)
             if "代码" in msg or "announcementId" in msg:
-                raise UpstreamSchemaGap(f"akshare schema gap for {ds}") from e
+                raise UpstreamSchemaGap(f"no data for {ds}") from e
             last_err = e
         except Exception as e:  # noqa: BLE001
             last_err = e
@@ -231,28 +235,40 @@ def backfill(
         try:
             df = _fetch_one_day(cursor)
         except UpstreamSchemaGap:
-            # Permanent: akshare has no historical support for this date.
-            # Record to gap_file so future runs skip immediately. Once
-            # we see 3 consecutive gap days, walk cursor back to
-            # end_date (it's a lost cause — everything older has the
-            # same schema issue).
+            # No-data marker covers two cases:
+            # (a) non-trading day (weekend / holiday) — empty response
+            #     triggers akshare column-rename KeyError.
+            # (b) pre-2021 historical — akshare's parser never supported.
+            # Both are permanent. Write an empty parquet marker + record
+            # to gap file so future cron doesn't retry.
             schema_gap_dates.add(cursor.isoformat())
             days_schema_gap += 1
-            # Persist gap file periodically (every 10 new gaps).
+            # Write empty parquet so `offset >= 2 and day_parquet.exists()`
+            # skip check in fetch_filings also applies to backfill.
+            day_parquet.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                columns=["代码", "简称", "公告标题", "公告时间",
+                         "公告链接", "mirror_fetch_date"],
+            ).to_parquet(day_parquet, compression="zstd", index=False)
+            # Persist gap file periodically.
             if days_schema_gap % 10 == 1:
                 gap_file.write_text(
                     json.dumps(sorted(schema_gap_dates), ensure_ascii=False),
                 )
-            # If we've hit 30 consecutive gap days, akshare is definitely
-            # done. Stop the scan — any older dates will have the same
-            # KeyError. This keeps future runs from wasting API calls.
-            recent_gap = all(
-                (cursor - timedelta(days=k)).isoformat() in schema_gap_dates
-                for k in range(30)
-            )
-            if recent_gap and days_attempted > 30:
-                log.warning("  30 consecutive schema gaps — akshare has no "
-                            "pre-%s support, stopping scan", cursor)
+            # Stop-scan heuristic (W12 rethink): weekends + Chinese
+            # holidays = ~120 non-trading days per year, so raw
+            # "consecutive gap days" is NOT a good "akshare is done"
+            # signal. Instead: stop if 30 consecutive CALENDAR days
+            # produced ZERO real filings (every one marked gap).
+            # With weekends alone that's impossible; only pre-akshare-
+            # support eras hit this.
+            window = [(cursor - timedelta(days=k)).isoformat()
+                      for k in range(30)]
+            if all(d in schema_gap_dates for d in window) and days_attempted > 30:
+                log.warning(
+                    "  30 consecutive days all gap — akshare has no "
+                    "data older than %s, stopping scan", cursor,
+                )
                 break
             cursor += timedelta(days=1)
             continue
