@@ -1,8 +1,8 @@
 {
   "endpoints": {
     "securities": {
-      "last_success": "2026-04-26T10:17:32.523383+00:00",
-      "last_elapsed_s": 8.4,
+      "last_success": "2026-04-26T06:43:41.769935+00:00",
+      "last_elapsed_s": 8.3,
       "last_meta": {
         "rows": 5510,
         "size_kb": 90,
@@ -10,7 +10,7 @@
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-04-26T10:17:32.523383+00:00"
+      "last_attempt": "2026-04-26T06:43:41.769935+00:00"
     },
     "market_daily": {
       "last_success": "2026-04-24T09:39:36.507661+00:00",
@@ -26,27 +26,27 @@
       "last_attempt": "2026-04-26T08:54:06.241809+00:00"
     },
     "macro": {
-      "last_success": "2026-04-26T10:17:45.586010+00:00",
-      "last_elapsed_s": 12.6,
+      "last_success": "2026-04-26T06:43:54.498571+00:00",
+      "last_elapsed_s": 12.5,
       "last_meta": {
         "rows": 3215
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-04-26T10:17:45.586010+00:00"
+      "last_attempt": "2026-04-26T06:43:54.498571+00:00"
     },
     "news": {
-      "last_success": "2026-04-26T10:17:46.286313+00:00",
-      "last_elapsed_s": 0.6,
+      "last_success": "2026-04-26T06:43:55.259288+00:00",
+      "last_elapsed_s": 0.7,
       "last_meta": {
         "rows": 20
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-04-26T10:17:46.286313+00:00"
+      "last_attempt": "2026-04-26T06:43:55.259288+00:00"
     },
     "north_flow": {
-      "last_success": "2026-04-26T10:19:20.021405+00:00",
+      "last_success": "2026-04-26T06:45:18.633030+00:00",
       "last_elapsed_s": 2.5,
       "last_meta": {
         "rows": 2767,
@@ -54,11 +54,11 @@
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-04-26T10:19:20.021405+00:00"
+      "last_attempt": "2026-04-26T06:45:18.633030+00:00"
     },
     "lhb": {
-      "last_success": "2026-04-26T10:19:38.483120+00:00",
-      "last_elapsed_s": 18.4,
+      "last_success": "2026-04-26T06:45:37.265714+00:00",
+      "last_elapsed_s": 18.6,
       "last_meta": {
         "rows": 1752,
         "size_kb": 201,
@@ -69,11 +69,11 @@
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-04-26T10:19:38.483120+00:00"
+      "last_attempt": "2026-04-26T06:45:37.265714+00:00"
     },
     "yjyg": {
-      "last_success": "2026-04-26T10:19:47.832902+00:00",
-      "last_elapsed_s": 9.3,
+      "last_success": "2026-04-26T06:45:46.283460+00:00",
+      "last_elapsed_s": 9.0,
       "last_meta": {
         "rows": 28074,
         "size_kb": 11085,
@@ -83,31 +83,35 @@
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-04-26T10:19:47.832902+00:00"
+      "last_attempt": "2026-04-26T06:45:46.283460+00:00"
     },
     "margin": {
-      "last_success": "2026-04-26T10:20:09.505023+00:00",
-      "last_elapsed_s": 20.8,
+      "last_success": "2026-04-26T06:45:49.947024+00:00",
+      "last_elapsed_s": 3.5,
       "last_meta": {
-        "rows": 26
+        "rows": 20
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-04-26T10:20:09.505023+00:00"
+      "last_attempt": "2026-04-26T06:45:49.947024+00:00"
     },
     "research": {
-      "last_success": "2026-04-22T10:31:21.494271+00:00",
-      "last_elapsed_s": 3.4,
+      "last_success": "2026-04-26T10:45:52.585175+00:00",
+      "last_elapsed_s": 1840.3,
       "last_meta": {
-        "rows": 0,
-        "note": "all symbol variants failed — likely upstream schema change"
+        "rows": 23863,
+        "aggregate_rows": 63,
+        "top_up_rows": 23800,
+        "top_up_tickers": 1000,
+        "size_kb": 1407
       },
       "last_error": null,
-      "fail_streak": 0
+      "fail_streak": 0,
+      "last_attempt": "2026-04-26T10:45:52.585175+00:00"
     },
     "filings": {
-      "last_attempt": "2026-04-26T10:19:17.431169+00:00",
-      "last_elapsed_s": 91.1,
+      "last_attempt": "2026-04-26T06:45:16.104063+00:00",
+      "last_elapsed_s": 80.8,
       "last_meta": {
         "rows": 58565,
         "size_kb": 2203,
@@ -119,7 +123,7 @@
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_success": "2026-04-26T10:19:17.431169+00:00"
+      "last_success": "2026-04-26T06:45:16.104063+00:00"
     },
     "financials": {
       "last_attempt": "2026-04-25T19:56:43.005985+00:00",
@@ -195,11 +199,11 @@
     }
   },
   "last_pass": {
-    "at": "2026-04-26T10:20:09.560405+00:00",
-    "succeeded": 8,
+    "at": "2026-04-26T09:41:02.632713+00:00",
+    "succeeded": 3,
     "failed": 0,
     "skipped": 0,
-    "elapsed_s": 165.5
+    "elapsed_s": 17.4
   },
-  "updated_at": "2026-04-26T10:20:09.560438+00:00"
+  "updated_at": "2026-04-26T10:45:52.585476+00:00"
 }
