@@ -947,21 +947,29 @@ def fetch_concepts() -> dict:
     boards = _fetch_board_names("concept", "concepts")
     names = boards["板块名称"].tolist() if "板块名称" in boards.columns else []
 
-    def one(name: str):
-        m = _ak_call(ak.stock_board_concept_cons_em, symbol=name)
-        if m is not None and not m.empty:
-            m = m.copy()
-            m["board"] = name
-            return m
-        return None
-
+    # EM-health probe: ONE call. If EM is down (same RemoteDisconnected
+    # that killed fetch_board_names' EM path), skip the per-board loop
+    # entirely — otherwise each of 375 boards individually retries EM
+    # 5× with exponential backoff = 40+ hour run.
     members = pd.DataFrame()
     members_source = "em"
-    try:
-        members = _per_ticker_serial(names, one, label="concept-members")
-    except Exception as e:  # noqa: BLE001
-        log.warning("  concepts.members (EM) failed: %s — skipping members write", e)
+    if not names or not _em_probe_healthy(ak.stock_board_concept_cons_em, symbol=names[0]):
+        log.warning("  concepts.members EM probe failed — skipping (boards kept)")
         members_source = "skipped_em_down"
+    else:
+        def one(name: str):
+            m = _ak_call(ak.stock_board_concept_cons_em, symbol=name)
+            if m is not None and not m.empty:
+                m = m.copy()
+                m["board"] = name
+                return m
+            return None
+
+        try:
+            members = _per_ticker_serial(names, one, label="concept-members")
+        except Exception as e:  # noqa: BLE001
+            log.warning("  concepts.members (EM) failed: %s — skipping members write", e)
+            members_source = "skipped_em_down"
     kb = 0
     if not members.empty:
         kb = _write_parquet(members, "concepts/members.parquet")
@@ -974,26 +982,46 @@ def fetch_industries() -> dict:
     boards = _fetch_board_names("industry", "industries")
     names = boards["板块名称"].tolist() if "板块名称" in boards.columns else []
 
-    def one(name: str):
-        m = _ak_call(ak.stock_board_industry_cons_em, symbol=name)
-        if m is not None and not m.empty:
-            m = m.copy()
-            m["board"] = name
-            return m
-        return None
-
     members = pd.DataFrame()
     members_source = "em"
-    try:
-        members = _per_ticker_serial(names, one, label="industry-members")
-    except Exception as e:  # noqa: BLE001
-        log.warning("  industries.members (EM) failed: %s — skipping members write", e)
+    if not names or not _em_probe_healthy(ak.stock_board_industry_cons_em, symbol=names[0]):
+        log.warning("  industries.members EM probe failed — skipping (boards kept)")
         members_source = "skipped_em_down"
+    else:
+        def one(name: str):
+            m = _ak_call(ak.stock_board_industry_cons_em, symbol=name)
+            if m is not None and not m.empty:
+                m = m.copy()
+                m["board"] = name
+                return m
+            return None
+
+        try:
+            members = _per_ticker_serial(names, one, label="industry-members")
+        except Exception as e:  # noqa: BLE001
+            log.warning("  industries.members (EM) failed: %s — skipping members write", e)
+            members_source = "skipped_em_down"
     kb = 0
     if not members.empty:
         kb = _write_parquet(members, "industries/members.parquet")
     return {"boards": len(boards), "members": len(members),
             "size_kb": kb, "members_source": members_source}
+
+
+def _em_probe_healthy(fn, **kwargs) -> bool:
+    """Quick single-call health probe — no retries. Returns True only
+    on clean success, False on any exception (including the RemoteDisconnected
+    that indicates the endpoint is currently down).
+
+    Purpose: avoid per-item retry loops burning 6+ minutes per failure
+    on endpoints we already know are broken at the host level.
+    """
+    try:
+        df = fn(**kwargs)
+        return df is not None
+    except Exception as e:  # noqa: BLE001
+        log.info("  EM probe failed (%s): %s", fn.__name__, type(e).__name__)
+        return False
 
 
 def _fetch_board_names(kind: str, dir_label: str) -> pd.DataFrame:
