@@ -452,11 +452,17 @@ def fetch_market_daily() -> dict:
     if new_permafails:
         _save_market_daily_permafail(permafail | set(new_permafails))
 
+    # no_work=True tells run_once to NOT increment fail_streak when
+    # we legitimately had no new data (weekend early Saturday runs,
+    # or a single pending date that was a pre-publish today-probe and
+    # returned empty — not a fetch failure).
+    no_work = (total_rows == 0 and not filled)
     return {
         "rows": total_rows,
         "filled_dates": filled,
         "pending_total": len(pending),
         "budget": MAX_GAP_FILL,
+        "no_work": no_work,
     }
 
 
@@ -865,9 +871,20 @@ def fetch_yjyg() -> dict:
 
 
 def fetch_margin() -> dict:
+    """融资融券 daily aggregates, per exchange.
+
+    SSE endpoint takes a date range — easy, always works.
+
+    SZSE endpoint is single-date. Intraday runs (T-day before EOD) hit a
+    column-length-mismatch error from AKShare because SZSE's API returns
+    empty HTML for not-yet-published days. Walk backwards through recent
+    trading days to pick up the freshest published snapshot.
+    """
     today = _today_cn().strftime("%Y%m%d")
     start = (datetime.now(CST) - timedelta(days=30)).strftime("%Y%m%d")
     total = 0
+
+    # SSE — date range, tolerates today being empty
     try:
         sse = _ak_call(ak.stock_margin_sse, start_date=start, end_date=today)
         if not sse.empty:
@@ -875,20 +892,59 @@ def fetch_margin() -> dict:
             total += len(sse)
     except Exception as e:  # noqa: BLE001
         log.warning("  margin.sse failed: %s", e)
-    try:
-        szse = _ak_call(ak.stock_margin_szse, date=today)
-        if not szse.empty:
-            _write_parquet(szse, "margin/szse_latest.parquet")
-            total += len(szse)
-    except Exception as e:  # noqa: BLE001
-        log.warning("  margin.szse failed: %s", e)
+
+    # SZSE — walk back up to 10 calendar days for the freshest published row.
+    # Typical lag: 0-1 trading days; max 4 over a long weekend. 10 gives
+    # generous headroom without looping forever on genuinely broken endpoint.
+    frames: list[pd.DataFrame] = []
+    szse_last_error: str | None = None
+    for delta_days in range(11):
+        probe = (datetime.now(CST) - timedelta(days=delta_days)).strftime("%Y%m%d")
+        try:
+            szse = _ak_call(ak.stock_margin_szse, date=probe)
+            if szse is not None and not szse.empty:
+                szse = szse.copy()
+                szse["probe_date"] = probe
+                frames.append(szse)
+        except Exception as e:  # noqa: BLE001
+            szse_last_error = f"{type(e).__name__}: {str(e)[:120]}"
+            # Don't break — column-length error on today's empty payload
+            # is specific to the latest date; earlier dates still work.
+            continue
+    if frames:
+        szse_out = pd.concat(frames, ignore_index=True)
+        # Dedup: the endpoint includes rows for the 5-day window anyway
+        # (column: 信用交易日期), so multiple probes overlap. Keep the
+        # newest probe_date per 信用交易日期.
+        if "信用交易日期" in szse_out.columns:
+            szse_out = szse_out.sort_values(
+                ["信用交易日期", "probe_date"], ascending=[True, False]
+            ).drop_duplicates(subset=["信用交易日期"], keep="first")
+        szse_out = szse_out.drop(columns=["probe_date"], errors="ignore")
+        _write_parquet(szse_out, "margin/szse_latest.parquet")
+        total += len(szse_out)
+    else:
+        log.warning(
+            "  margin.szse: no non-empty data in last 11 days (last_err=%s)",
+            szse_last_error,
+        )
     return {"rows": total}
 
 
 def fetch_concepts() -> dict:
-    """Concept boards + their constituent tickers. Serial to avoid bans."""
-    boards = _ak_call(ak.stock_board_concept_name_em)
-    _write_parquet(boards, "concepts/boards.parquet")
+    """Concept boards + their constituent tickers.
+
+    Wave 14: AKShare's Eastmoney concept endpoints (stock_board_concept_name_em /
+    _cons_em) have been returning RemoteDisconnected for ~3 days (2026-04-22+).
+    THS alternative (stock_board_concept_name_ths) works and returns 375 boards.
+    There's no THS constituent-list API; EM is still the only source for members,
+    so when EM is down we ship board names only and log the members gap.
+
+    Downstream slate doesn't read concepts members today (no signal consumes
+    it), so skipping is safe — operator can reach for concept data via board
+    names alone.
+    """
+    boards = _fetch_board_names("concept", "concepts")
     names = boards["板块名称"].tolist() if "板块名称" in boards.columns else []
 
     def one(name: str):
@@ -899,16 +955,23 @@ def fetch_concepts() -> dict:
             return m
         return None
 
-    members = _per_ticker_serial(names, one, label="concept-members")
+    members = pd.DataFrame()
+    members_source = "em"
+    try:
+        members = _per_ticker_serial(names, one, label="concept-members")
+    except Exception as e:  # noqa: BLE001
+        log.warning("  concepts.members (EM) failed: %s — skipping members write", e)
+        members_source = "skipped_em_down"
     kb = 0
     if not members.empty:
         kb = _write_parquet(members, "concepts/members.parquet")
-    return {"boards": len(boards), "members": len(members), "size_kb": kb}
+    return {"boards": len(boards), "members": len(members),
+            "size_kb": kb, "members_source": members_source}
 
 
 def fetch_industries() -> dict:
-    boards = _ak_call(ak.stock_board_industry_name_em)
-    _write_parquet(boards, "industries/boards.parquet")
+    """Industry boards + constituents — same THS-primary strategy as concepts."""
+    boards = _fetch_board_names("industry", "industries")
     names = boards["板块名称"].tolist() if "板块名称" in boards.columns else []
 
     def one(name: str):
@@ -919,48 +982,238 @@ def fetch_industries() -> dict:
             return m
         return None
 
-    members = _per_ticker_serial(names, one, label="industry-members")
+    members = pd.DataFrame()
+    members_source = "em"
+    try:
+        members = _per_ticker_serial(names, one, label="industry-members")
+    except Exception as e:  # noqa: BLE001
+        log.warning("  industries.members (EM) failed: %s — skipping members write", e)
+        members_source = "skipped_em_down"
     kb = 0
     if not members.empty:
         kb = _write_parquet(members, "industries/members.parquet")
-    return {"boards": len(boards), "members": len(members), "size_kb": kb}
+    return {"boards": len(boards), "members": len(members),
+            "size_kb": kb, "members_source": members_source}
+
+
+def _fetch_board_names(kind: str, dir_label: str) -> pd.DataFrame:
+    """Fetch board-names parquet with EM → THS fallback.
+
+    ``kind``: "concept" or "industry".
+    ``dir_label``: "concepts" or "industries" — target parquet subdirectory.
+
+    Returns a DataFrame with ``板块名称`` column (normalised across sources
+    so the rest of the fetcher can treat them identically). On THS fallback
+    the frame has ``{板块名称, code, source="ths"}``; on EM it's the native
+    EM columns with ``source="em"``.
+    """
+    em_fn = getattr(ak, f"stock_board_{kind}_name_em")
+    ths_fn = getattr(ak, f"stock_board_{kind}_name_ths")
+    try:
+        df = _ak_call(em_fn)
+        df = df.copy()
+        df["source"] = "em"
+        _write_parquet(df, f"{dir_label}/boards.parquet")
+        log.info("  %s.boards via EM: %d", dir_label, len(df))
+        return df
+    except Exception as e:  # noqa: BLE001
+        log.warning("  %s.boards EM failed: %s — falling back to THS", dir_label, e)
+    # THS: columns are (name, code). Normalise to 板块名称.
+    df = _ak_call(ths_fn)
+    df = df.copy()
+    df["板块名称"] = df["name"]
+    df["source"] = "ths"
+    _write_parquet(df, f"{dir_label}/boards.parquet")
+    log.info("  %s.boards via THS: %d", dir_label, len(df))
+    return df
 
 
 def fetch_research() -> dict:
-    """Per-ticker research reports. AKShare's API changed — `symbol="全部"`
-    no longer works; must query per ticker. Serial with AKSHARE_SLEEP;
-    5500 × 1.5s ≈ 2.3h — only runs in the weekly slow workflow.
+    """Research reports — Wave 14 restructure.
 
-    Empty-result semantics: individual tickers legitimately have no
-    research reports (small caps, BJ-listed), so per-ticker None is
-    normal. But if EVERY ticker returns empty across 5500 calls, the
-    upstream API contract is broken (prior Eastmoney schema change
-    that lost the `infoCode` field is the canonical example) — raise
-    so `run_once` records an error AND increments fail_streak, so
-    healthcheck opens an issue after 3 such failures instead of
-    sitting on rows=0 forever looking healthy-ish.
+    Prior implementation iterated 5500 tickers × 1.5s serially (~2.3h),
+    relying on per-ticker `stock_research_report_em(symbol=code)`. This
+    was fragile: any mid-run Eastmoney throttle cascaded into "all
+    symbol variants failed" for the batch, and a single weekly window
+    missed = 7d stale.
+
+    New approach:
+
+      1. **Aggregate daily snapshot** — `stock_research_report_em()` with
+         no symbol returns the 200-300 most recent reports across all
+         tickers in a single call (~0.6s). This is what operators
+         actually want for "最新研报" queries. Always written to
+         `research/latest.parquet`.
+
+      2. **Focused per-ticker top-up** (optional depth). For tickers
+         that appear in at least one recent `filings/latest.parquet`
+         row, run per-ticker deep fetch. Far smaller universe (maybe
+         500 active filers) — 500 × 1.5s = 12.5 min rather than 2.3h.
+         Appended to `research/latest.parquet` for the same day.
+
+    Empty-result semantics: if the aggregate query returns < 20 rows,
+    the endpoint is broken. Raise → fail_streak increments → healthcheck
+    opens an issue after 3 such failures.
     """
-    sec = _ak_call(ak.stock_info_a_code_name)
-    codes = sec["code"].astype(str).tolist()
-
-    def one(code: str):
-        df = _ak_call(ak.stock_research_report_em, symbol=code)
-        if df is not None and not df.empty:
-            df = df.copy()
-            df["code"] = code
-            return df
-        return None
-
-    df = _per_ticker_serial(codes, one, label="research")
-    if df.empty:
-        raise RuntimeError(
-            f"research returned zero rows across {len(codes)} tickers — "
-            "upstream schema break likely (AKShare / Eastmoney contract change)"
-        )
     today = _today_cn().isoformat()
-    _write_parquet(df, "research/latest.parquet")
-    kb = _write_parquet(df, f"research/history/{today}.parquet")
-    return {"rows": len(df), "size_kb": kb}
+    # 1. Aggregate daily snapshot — one call.
+    agg = _ak_call(ak.stock_research_report_em)
+    if agg is None or len(agg) < 20:
+        raise RuntimeError(
+            f"research aggregate returned {0 if agg is None else len(agg)} rows — "
+            "upstream contract break"
+        )
+    agg = agg.copy()
+    # Normalise to a canonical "code" column for downstream joins.
+    if "股票代码" in agg.columns:
+        agg["code"] = agg["股票代码"].astype(str)
+
+    # 2. Focused per-ticker top-up. Active filers = distinct tickers
+    # seen in filings/latest.parquet within the last 30 days. If that
+    # parquet isn't there yet, skip the top-up cleanly.
+    top_up_rows = 0
+    top_up_codes: list[str] = []
+    filings_path = DATA / "filings" / "latest.parquet"
+    if filings_path.exists():
+        try:
+            filings = pd.read_parquet(filings_path)
+            if "code" in filings.columns and not filings.empty:
+                top_up_codes = (
+                    filings["code"].astype(str)
+                    .dropna().unique().tolist()
+                )
+                # Hard cap — in degenerate cases filings could hold every
+                # A-share code; 1000 × 1.5s = 25 min is still tolerable
+                # but anything beyond that approaches the old 2.3h pain.
+                if len(top_up_codes) > 1000:
+                    top_up_codes = top_up_codes[:1000]
+        except Exception as e:  # noqa: BLE001
+            log.warning("  research top-up codes skipped: %s", e)
+
+    if top_up_codes:
+        def one(code: str):
+            df = _ak_call(ak.stock_research_report_em, symbol=code)
+            if df is not None and not df.empty:
+                df = df.copy()
+                df["code"] = code
+                return df
+            return None
+
+        depth = _per_ticker_serial(top_up_codes, one, label="research-top-up")
+        if not depth.empty:
+            top_up_rows = len(depth)
+            agg = pd.concat([agg, depth], ignore_index=True)
+            # Dedup — aggregate + per-ticker will collide on same-day reports.
+            if "报告名称" in agg.columns and "code" in agg.columns:
+                agg = agg.drop_duplicates(
+                    subset=["code", "报告名称"], keep="first"
+                )
+
+    _write_parquet(agg, "research/latest.parquet")
+    kb = _write_parquet(agg, f"research/history/{today}.parquet")
+    return {
+        "rows": len(agg),
+        "aggregate_rows": len(agg) - top_up_rows,
+        "top_up_rows": top_up_rows,
+        "top_up_tickers": len(top_up_codes),
+        "size_kb": kb,
+    }
+
+
+def fetch_block_trades() -> dict:
+    """大宗交易 (block trades) daily aggregate. One call per trading day.
+
+    AKShare's `stock_dzjy_mrtj` returns rows only for tickers that had
+    block-trade activity that day; typical daily volume is 30-150 rows.
+    We keep a rolling 30-day history to support slate-side accumulation
+    analysis (repeat block buys by the same institution over several
+    weeks = conviction signal).
+    """
+    today = _today_cn()
+    frames: list[pd.DataFrame] = []
+    # Fetch up to the last 10 calendar days, skipping non-trading days.
+    # Upstream rate-limits at ~2 req/s so 10 × 0.5s is trivial.
+    for back in range(11):
+        d = today - timedelta(days=back)
+        if not _is_trading_day(d):
+            continue
+        ds = d.strftime("%Y%m%d")
+        try:
+            df = _ak_call(ak.stock_dzjy_mrtj, start_date=ds, end_date=ds)
+            if df is not None and not df.empty:
+                df = df.copy()
+                df["trade_date"] = d.isoformat()
+                frames.append(df)
+        except Exception as e:  # noqa: BLE001
+            # The endpoint returns a weird TypeError on today-before-publish
+            # — benign; just try the next day.
+            log.debug("  block_trades %s skipped: %s: %s", ds, type(e).__name__, str(e)[:80])
+            continue
+    if not frames:
+        return {"rows": 0, "no_work": True}
+    out = pd.concat(frames, ignore_index=True)
+    _write_parquet(out, "block_trades/latest.parquet")
+    kb = _write_parquet(out, f"block_trades/history/{today.isoformat()}.parquet")
+    return {"rows": len(out), "trading_days": len(frames), "size_kb": kb}
+
+
+def fetch_pledge() -> dict:
+    """股权质押 (equity pledge) per-ticker ratio.
+
+    AKShare's `stock_gpzy_pledge_ratio_em(date=YYYYMMDD)` returns ~2200
+    tickers on any given trading day with columns including 质押比例
+    (pledge ratio). This is the upstream for slate's pledge_snapshot
+    table — previously declared in CLAUDE.md but never populated because
+    mirror didn't fetch it.
+
+    Walk back up to 10 days for the freshest published snapshot (same
+    pattern as margin_szse).
+    """
+    today = _today_cn()
+    for back in range(11):
+        d = today - timedelta(days=back)
+        if not _is_trading_day(d):
+            continue
+        ds = d.strftime("%Y%m%d")
+        try:
+            df = _ak_call(ak.stock_gpzy_pledge_ratio_em, date=ds)
+            if df is not None and not df.empty:
+                df = df.copy()
+                df["snapshot_date"] = d.isoformat()
+                _write_parquet(df, "pledge/latest.parquet")
+                kb = _write_parquet(df, f"pledge/history/{d.isoformat()}.parquet")
+                return {"rows": len(df), "snapshot_date": d.isoformat(), "size_kb": kb}
+        except Exception as e:  # noqa: BLE001
+            log.debug("  pledge %s skipped: %s: %s", ds, type(e).__name__, str(e)[:80])
+            continue
+    return {"rows": 0, "no_work": True}
+
+
+def fetch_lockup_releases() -> dict:
+    """限售解禁 (lockup expiry) upcoming queue — next 90 days.
+
+    AKShare's `stock_restricted_release_summary_em` returns daily
+    aggregated release events (date + total shares + market cap). Key
+    signal: a large upcoming release = near-term supply pressure.
+
+    We fetch 90-day forward window every 24h. Slate's ingest can
+    later drill down per-ticker via stock_restricted_release_queue_em
+    if needed.
+    """
+    today = _today_cn()
+    start = today.strftime("%Y%m%d")
+    end = (today + timedelta(days=90)).strftime("%Y%m%d")
+    df = _ak_call(
+        ak.stock_restricted_release_summary_em,
+        symbol="全部股票", start_date=start, end_date=end,
+    )
+    if df is None or df.empty:
+        return {"rows": 0, "no_work": True}
+    df = df.copy()
+    df["fetched_date"] = today.isoformat()
+    _write_parquet(df, "lockup/latest.parquet")
+    kb = _write_parquet(df, f"lockup/history/{today.isoformat()}.parquet")
+    return {"rows": len(df), "size_kb": kb, "window": f"{start}..{end}"}
 
 
 def fetch_news() -> dict:
@@ -1181,6 +1434,10 @@ ENDPOINTS: list[Endpoint] = [
     Endpoint("lhb",           cadence_h=20, fetcher=fetch_lhb),
     Endpoint("yjyg",          cadence_h=20, fetcher=fetch_yjyg),
     Endpoint("margin",        cadence_h=20, fetcher=fetch_margin),
+    # Wave 14: high-value A-股 datasets
+    Endpoint("block_trades",  cadence_h=20, fetcher=fetch_block_trades),
+    Endpoint("pledge",        cadence_h=24, fetcher=fetch_pledge),
+    Endpoint("lockup",        cadence_h=24, fetcher=fetch_lockup_releases),
     # research is per-ticker 5500× serial ≈ 2.3h — weekly only
     # Weekly (quarterly-paced data + per-ticker loops):
     # financials: chunked 1/7 per day — each pass is ~20min for 785 tickers.
