@@ -1073,7 +1073,7 @@ def fetch_research() -> dict:
     # parquet isn't there yet, skip the top-up cleanly.
     top_up_rows = 0
     top_up_codes: list[str] = []
-    filings_path = DATA / "filings" / "latest.parquet"
+    filings_path = DATA_DIR / "filings" / "latest.parquet"
     if filings_path.exists():
         try:
             filings = pd.read_parquet(filings_path)
