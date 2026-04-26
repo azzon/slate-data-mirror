@@ -1634,7 +1634,16 @@ def run_once(*, only: list[str] | None, force: bool, incremental_push: bool) -> 
             meta = ep.fetcher()
             elapsed = time.time() - ep_started
             now_iso = datetime.now(timezone.utc).isoformat()
-            produced_data = meta.get("rows", 0) > 0 or bool(meta.get("filled_dates"))
+            produced_data = (
+                meta.get("rows", 0) > 0
+                or bool(meta.get("filled_dates"))
+                # Concepts/industries: rows=0 (no per-member constituent
+                # data) but boards>0 is legitimate partial success when
+                # EM is down — we still wrote boards.parquet. Count it
+                # as success so fail_streak doesn't climb for a known-
+                # expected upstream outage.
+                or meta.get("boards", 0) > 0
+            )
             no_work = bool(meta.get("no_work"))
             new_streak = 0 if produced_data or no_work else prior.get("fail_streak", 0) + 1
             status["endpoints"][ep.name] = {
