@@ -913,14 +913,18 @@ def fetch_margin() -> dict:
             continue
     if frames:
         szse_out = pd.concat(frames, ignore_index=True)
-        # Dedup: the endpoint includes rows for the 5-day window anyway
-        # (column: 信用交易日期), so multiple probes overlap. Keep the
-        # newest probe_date per 信用交易日期.
+        # SZSE's stock_margin_szse returns a daily summary with NO date
+        # column — the date is implicit from the query arg. We tracked it
+        # in ``probe_date``. Normalise to ``信用交易日期`` so the parquet
+        # matches the SSE schema and slate's ingest_margin can parse
+        # both identically.
+        if "信用交易日期" not in szse_out.columns and "probe_date" in szse_out.columns:
+            szse_out["信用交易日期"] = szse_out["probe_date"]
+        szse_out = szse_out.drop(columns=["probe_date"], errors="ignore")
         if "信用交易日期" in szse_out.columns:
             szse_out = szse_out.sort_values(
-                ["信用交易日期", "probe_date"], ascending=[True, False]
+                "信用交易日期", ascending=False
             ).drop_duplicates(subset=["信用交易日期"], keep="first")
-        szse_out = szse_out.drop(columns=["probe_date"], errors="ignore")
         _write_parquet(szse_out, "margin/szse_latest.parquet")
         total += len(szse_out)
     else:
