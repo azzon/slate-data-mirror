@@ -140,18 +140,18 @@
       "last_success": "2026-04-25T19:56:43.005985+00:00"
     },
     "concepts": {
-      "last_attempt": "2026-04-26T11:31:23.400978+00:00",
+      "last_attempt": "2026-04-30T20:10:19.528429+00:00",
       "last_error": null,
       "last_error_at": "2026-04-24T05:13:45.686873+00:00",
       "fail_streak": 0,
-      "last_elapsed_s": 441.7,
+      "last_elapsed_s": 13.2,
       "last_meta": {
-        "boards": 375,
+        "boards": 486,
         "members": 0,
         "size_kb": 0,
         "members_source": "skipped_em_down"
       },
-      "last_success": "2026-04-26T11:31:23.400978+00:00"
+      "last_success": "2026-04-30T20:10:19.528429+00:00"
     },
     "industries": {
       "last_attempt": "2026-04-26T11:38:38.599989+00:00",
@@ -222,5 +222,5 @@
     "skipped": 0,
     "elapsed_s": 319.2
   },
-  "updated_at": "2026-04-30T14:58:10.614599+00:00"
+  "updated_at": "2026-04-30T20:10:19.528605+00:00"
 }
