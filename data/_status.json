@@ -154,18 +154,18 @@
       "last_success": "2026-04-30T20:10:19.528429+00:00"
     },
     "industries": {
-      "last_attempt": "2026-04-26T11:38:38.599989+00:00",
+      "last_attempt": "2026-04-30T20:17:38.752042+00:00",
       "last_error": null,
       "last_error_at": "2026-04-24T05:20:54.945005+00:00",
       "fail_streak": 0,
-      "last_elapsed_s": 435.1,
+      "last_elapsed_s": 437.8,
       "last_meta": {
         "boards": 90,
         "members": 0,
         "size_kb": 0,
         "members_source": "skipped_em_down"
       },
-      "last_success": "2026-04-26T11:38:38.599989+00:00"
+      "last_success": "2026-04-30T20:17:38.752042+00:00"
     },
     "shareholders": {
       "last_attempt": "2026-04-25T19:17:09.020819+00:00",
@@ -222,5 +222,5 @@
     "skipped": 0,
     "elapsed_s": 319.2
   },
-  "updated_at": "2026-04-30T20:10:19.528605+00:00"
+  "updated_at": "2026-04-30T20:17:38.752315+00:00"
 }
