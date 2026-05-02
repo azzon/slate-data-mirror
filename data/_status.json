@@ -168,15 +168,15 @@
       "last_success": "2026-04-30T20:17:38.752042+00:00"
     },
     "shareholders": {
-      "last_attempt": "2026-04-25T19:17:09.020819+00:00",
-      "last_elapsed_s": 5.8,
+      "last_attempt": "2026-05-02T18:50:24.266559+00:00",
+      "last_elapsed_s": 6.4,
       "last_meta": {
-        "rows": 5504,
-        "size_kb": 529
+        "rows": 5502,
+        "size_kb": 527
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_success": "2026-04-25T19:17:09.020819+00:00"
+      "last_success": "2026-05-02T18:50:24.266559+00:00"
     },
     "block_trades": {
       "last_attempt": "2026-04-26T09:40:57.305333+00:00",
@@ -222,5 +222,5 @@
     "skipped": 0,
     "elapsed_s": 79.8
   },
-  "updated_at": "2026-05-02T14:29:59.001567+00:00"
+  "updated_at": "2026-05-02T18:50:24.267120+00:00"
 }
