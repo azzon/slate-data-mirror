@@ -58,19 +58,19 @@
       "last_attempt": "2026-05-13T22:31:20.536804+00:00"
     },
     "lhb": {
-      "last_success": "2026-05-13T15:14:06.582386+00:00",
-      "last_elapsed_s": 22.2,
+      "last_success": "2026-05-13T22:31:42.286769+00:00",
+      "last_elapsed_s": 21.7,
       "last_meta": {
-        "rows": 1686,
-        "size_kb": 220,
+        "rows": 1624,
+        "size_kb": 212,
         "window_days": 30,
-        "days_ok": 2,
-        "days_err": 11,
+        "days_ok": 1,
+        "days_err": 12,
         "days_cached": 17
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-05-13T15:14:06.582386+00:00"
+      "last_attempt": "2026-05-13T22:31:42.286769+00:00"
     },
     "yjyg": {
       "last_success": "2026-05-13T15:14:14.996920+00:00",
@@ -222,5 +222,5 @@
     "skipped": 0,
     "elapsed_s": 115.7
   },
-  "updated_at": "2026-05-13T22:31:20.537226+00:00"
+  "updated_at": "2026-05-13T22:31:42.287370+00:00"
 }
