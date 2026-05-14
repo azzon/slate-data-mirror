@@ -154,18 +154,18 @@
       "last_success": "2026-05-14T20:26:29.714910+00:00"
     },
     "industries": {
-      "last_attempt": "2026-05-07T20:59:52.766631+00:00",
+      "last_attempt": "2026-05-14T20:33:48.248169+00:00",
       "last_error": null,
       "last_error_at": "2026-04-24T05:20:54.945005+00:00",
       "fail_streak": 0,
-      "last_elapsed_s": 1163.3,
+      "last_elapsed_s": 436.6,
       "last_meta": {
-        "boards": 496,
-        "members": 16782,
-        "size_kb": 658,
-        "members_source": "em"
+        "boards": 90,
+        "members": 0,
+        "size_kb": 0,
+        "members_source": "skipped_em_down"
       },
-      "last_success": "2026-05-07T20:59:52.766631+00:00"
+      "last_success": "2026-05-14T20:33:48.248169+00:00"
     },
     "shareholders": {
       "last_attempt": "2026-05-02T19:22:34.860636+00:00",
@@ -222,5 +222,5 @@
     "skipped": 0,
     "elapsed_s": 106.2
   },
-  "updated_at": "2026-05-14T20:26:29.715041+00:00"
+  "updated_at": "2026-05-14T20:33:48.248980+00:00"
 }
