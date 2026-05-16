@@ -112,8 +112,8 @@
       "last_attempt": "2026-05-12T20:57:13.000576+00:00"
     },
     "filings": {
-      "last_attempt": "2026-05-15T22:24:31.774573+00:00",
-      "last_elapsed_s": 22.6,
+      "last_attempt": "2026-05-16T03:08:44.450687+00:00",
+      "last_elapsed_s": 26.0,
       "last_meta": {
         "rows": 52475,
         "size_kb": 2123,
@@ -125,7 +125,7 @@
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_success": "2026-05-15T22:24:31.774573+00:00"
+      "last_success": "2026-05-16T03:08:44.450687+00:00"
     },
     "financials": {
       "last_attempt": "2026-04-25T19:56:43.005985+00:00",
@@ -223,5 +223,5 @@
     "skipped": 0,
     "elapsed_s": 99.9
   },
-  "updated_at": "2026-05-16T03:08:18.433699+00:00"
+  "updated_at": "2026-05-16T03:08:44.451374+00:00"
 }
