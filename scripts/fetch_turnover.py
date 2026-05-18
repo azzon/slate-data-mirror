@@ -61,19 +61,58 @@ def _code_to_ticker(code: str) -> str:
     return f"{code}.SZ"
 
 
+def _retry(fn, *, tries: int = 5, base_delay: float = 5.0):
+    """Exponential backoff for transient upstream errors."""
+    from http.client import RemoteDisconnected
+    from urllib.error import URLError
+    import requests
+    TRANSIENT = (
+        RemoteDisconnected, ConnectionError, ConnectionResetError,
+        URLError, TimeoutError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ReadTimeout,
+        requests.exceptions.ChunkedEncodingError,
+    )
+    last = None
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except TRANSIENT as e:
+            last = e
+            if attempt == tries:
+                raise
+            delay = base_delay * (3 ** (attempt - 1))
+            log.warning("  transient %s (try %d/%d) — retrying in %ds",
+                        type(e).__name__, attempt, tries, int(delay))
+            time.sleep(delay)
+    raise last
+
+
 def fetch_turnover_for_date(d: date) -> pd.DataFrame | None:
     """Fetch turnover_rate for all A-shares for a given date.
 
     Uses stock_zh_a_spot_em which returns today's real-time snapshot.
     Only useful for today (or intraday); historical turnover needs
     per-ticker calls.
+
+    Retries up to 5 times with exponential backoff on transient errors.
+    Falls back to stock_zh_a_hist_em (per-day bars with turnover) on failure.
     """
     time.sleep(AKSHARE_SLEEP)
+    df = None
     try:
-        df = ak.stock_zh_a_spot_em()
+        df = _retry(ak.stock_zh_a_spot_em)
     except Exception as e:
-        log.error("stock_zh_a_spot_em failed: %s", e)
-        return None
+        log.warning("stock_zh_a_spot_em failed after retries: %s", e)
+
+    # Fallback: stock_individual_fund_flow_rank (also has 换手率)
+    if df is None or df.empty:
+        log.info("trying fallback: stock_individual_fund_flow_rank")
+        try:
+            df = _retry(lambda: ak.stock_individual_fund_flow_rank(indicator="今日"))
+        except Exception as e2:
+            log.error("both endpoints failed: %s", e2)
+            return None
 
     if df is None or df.empty:
         log.warning("stock_zh_a_spot_em returned empty")
@@ -157,6 +196,11 @@ def main():
 
     if now.hour < 16:
         log.info("before 16:00 CST — market not closed yet, skipping")
+        return
+
+    # Skip weekends — no trading data available
+    if today.weekday() >= 5:
+        log.info("weekend (%s) — no trading data, skipping", today)
         return
 
     log.info("fetching turnover_rate for %s", today)
