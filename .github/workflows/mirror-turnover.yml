@@ -1,0 +1,55 @@
+name: Mirror turnover_rate
+
+# AKShare spot-endpoint daily turnover_rate for all A-shares.
+# Runs AFTER mirror-market (which writes OHLCV at 16:30/17:30 CST).
+# This merges turnover_rate into the existing market_daily parquet.
+on:
+  schedule:
+    - cron: "0 10 * * 1-5"   # 18:00 CST weekdays (after market close + OHLCV fetch)
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-turnover
+  cancel-in-progress: false
+
+jobs:
+  fetch-turnover:
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Checkout via SSH-over-443 + disk-budget re-shallow
+        timeout-minutes: 5
+        env:
+          WORK: ${{ github.workspace }}
+          REPO_URL: git@github.com:azzon/slate-data-mirror.git
+          GIT_BUDGET_MB: "300"
+        run: bash /home/runner/mirror-checkout.sh
+
+      - name: Ensure Python deps
+        run: |
+          python3 -m venv .venv
+          PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+          .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" --upgrade pip
+          .venv/bin/pip install --quiet --index-url "$PIP_INDEX_URL" -r requirements.txt
+
+      - name: Configure git identity + SSH remote
+        run: |
+          git config user.email "mirror-bot@slate"
+          git config user.name "slate-mirror-bot"
+          git remote set-url origin git@github.com:azzon/slate-data-mirror.git
+
+      - name: Fetch turnover_rate
+        env:
+          MIRROR_AKSHARE_SLEEP: "0.5"
+        run: .venv/bin/python scripts/fetch_turnover.py
+
+      - name: Commit and push
+        run: |
+          git add data/
+          if git diff --cached --quiet; then
+            echo "no turnover changes"
+            exit 0
+          fi
+          git commit -m "data(turnover_rate): $(date -u +%Y-%m-%dT%H:%MZ)"
+          git pull --rebase --autostash origin main || true
+          git push origin HEAD:main
