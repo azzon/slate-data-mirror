@@ -221,18 +221,23 @@ def _fetch_one_day_bars(d: date) -> pd.DataFrame | None:
     backfill days we leave it NULL because Tencent's qfq-history endpoint
     doesn't emit historical market cap.
     """
-    # Universe via Tencent probe — carries total_mv_yi so we can stamp
-    # today's market_cap into the parquet.
+    # Universe via Tencent probe — carries total_mv_yi + circ_mv_yi so
+    # we can stamp today's market_cap and turnover_rate into the parquet.
     universe = tm.fetch_universe()
     tickers = [u["ticker"] for u in universe]
-    # Build a ticker → market_cap_cny map for today's fetch only.
+    # Build ticker → market_cap_cny and ticker → circ_shares maps for today only.
     today = _today_cn()
     cap_by_ticker: dict[str, float | None] = {}
+    circ_shares_by_ticker: dict[str, float | None] = {}
     if d == today:
         for u in universe:
             mv_yi = u.get("total_mv_yi")
             if mv_yi is not None:
                 cap_by_ticker[u["ticker"]] = mv_yi * 1e8  # 亿元 → 元
+            circ_yi = u.get("circ_mv_yi")
+            last = u.get("last")
+            if circ_yi and last and last > 0:
+                circ_shares_by_ticker[u["ticker"]] = circ_yi * 1e8 / last
     start = end = d.strftime("%Y%m%d")
     bars_by_ticker = tm.fetch_daily_bars(tickers, start=start, end=end, max_workers=8)
 
@@ -242,13 +247,18 @@ def _fetch_one_day_bars(d: date) -> pd.DataFrame | None:
         for bar in bars:
             if bar["trade_date"] != d.isoformat():
                 continue
+            # turnover_rate = volume (shares) / circulating_shares
+            circ = circ_shares_by_ticker.get(ticker)
+            vol = bar["volume"]
+            tr = (vol / circ) if (circ and vol and circ > 0) else None
             rows.append({
                 "code": code, "ticker": ticker,
                 "trade_date": bar["trade_date"],
                 "open": bar["open"], "close": bar["close"],
                 "high": bar["high"], "low": bar["low"],
-                "volume": bar["volume"],
-                "market_cap": cap_by_ticker.get(ticker),  # None for backfill days
+                "volume": vol,
+                "market_cap": cap_by_ticker.get(ticker),
+                "turnover_rate": tr,
             })
     if not rows:
         return None
