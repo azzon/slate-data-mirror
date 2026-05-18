@@ -1,11 +1,9 @@
 name: Mirror turnover_rate
 
-# AKShare spot-endpoint daily turnover_rate for all A-shares.
-# Runs AFTER mirror-market (which writes OHLCV at 16:30/17:30 CST).
-# This merges turnover_rate into the existing market_daily parquet.
+# DEPRECATED: market_daily now computes turnover_rate from Tencent's
+# circ_mv_yi + volume. This workflow is kept as manual-only fallback
+# for cases where eastmoney's stock_zh_a_spot_em is needed.
 on:
-  schedule:
-    - cron: "0 10 * * 1-5"   # 18:00 CST weekdays (after market close + OHLCV fetch)
   workflow_dispatch:
 
 concurrency:
