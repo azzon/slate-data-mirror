@@ -128,7 +128,7 @@
       "last_success": "2026-05-18T15:18:36.992060+00:00"
     },
     "financials": {
-      "last_attempt": "2026-04-25T19:56:43.005985+00:00",
+      "last_attempt": "2026-05-18T20:32:40.264268+00:00",
       "last_elapsed_s": 2120.0,
       "last_meta": {
         "rows": 162960,
@@ -136,9 +136,10 @@
         "chunk_idx": 3,
         "size_kb": 26618
       },
-      "last_error": null,
-      "fail_streak": 0,
-      "last_success": "2026-04-25T19:56:43.005985+00:00"
+      "last_error": "RuntimeError: financials chunk 5 returned 0 rows",
+      "fail_streak": 1,
+      "last_success": "2026-04-25T19:56:43.005985+00:00",
+      "last_error_at": "2026-05-18T20:32:40.264314+00:00"
     },
     "concepts": {
       "last_attempt": "2026-05-14T20:26:29.714910+00:00",
@@ -217,11 +218,11 @@
     }
   },
   "last_pass": {
-    "at": "2026-05-18T15:19:31.279058+00:00",
-    "succeeded": 7,
+    "at": "2026-05-18T20:32:40.274748+00:00",
+    "succeeded": 0,
     "failed": 1,
     "skipped": 0,
-    "elapsed_s": 82.7
+    "elapsed_s": 1649.5
   },
-  "updated_at": "2026-05-18T15:19:31.279155+00:00"
+  "updated_at": "2026-05-18T20:32:40.274857+00:00"
 }
