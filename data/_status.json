@@ -54,24 +54,24 @@
         "size_kb": 198
       },
       "last_error": "TypeError: 'NoneType' object is not subscriptable",
-      "fail_streak": 37,
-      "last_attempt": "2026-05-22T15:16:07.873030+00:00",
-      "last_error_at": "2026-05-22T15:16:07.873067+00:00"
+      "fail_streak": 38,
+      "last_attempt": "2026-05-22T22:26:21.105921+00:00",
+      "last_error_at": "2026-05-22T22:26:21.105953+00:00"
     },
     "lhb": {
-      "last_success": "2026-05-22T15:16:30.184464+00:00",
-      "last_elapsed_s": 22.3,
+      "last_success": "2026-05-22T22:26:43.248755+00:00",
+      "last_elapsed_s": 22.1,
       "last_meta": {
-        "rows": 1841,
-        "size_kb": 233,
+        "rows": 1775,
+        "size_kb": 224,
         "window_days": 30,
-        "days_ok": 2,
-        "days_err": 11,
+        "days_ok": 1,
+        "days_err": 12,
         "days_cached": 17
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-05-22T15:16:30.184464+00:00"
+      "last_attempt": "2026-05-22T22:26:43.248755+00:00"
     },
     "yjyg": {
       "last_success": "2026-05-22T15:16:38.917568+00:00",
@@ -224,5 +224,5 @@
     "skipped": 0,
     "elapsed_s": 1651.1
   },
-  "updated_at": "2026-05-22T22:26:19.064040+00:00"
+  "updated_at": "2026-05-22T22:26:43.249704+00:00"
 }
