@@ -609,6 +609,42 @@ def _per_ticker_serial(
             pass
 
 
+def _parse_ths_value(v):
+    """Parse THS stringy value (e.g. '149.93万', '354.99%', False, '--') → float | None.
+
+    THS's stock_financial_abstract_ths returns mixed types — Boolean False for missing,
+    strings with 万/亿/% suffix for present values, occasional native float. Sina's
+    legacy schema was always float64, so we coerce here to keep the parquet schema stable.
+    """
+    if v is False or v is True or v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (ValueError, TypeError):
+        pass
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace(",", "")
+    if s in ("", "--", "False", "None", "NaN"):
+        return None
+    if s.endswith("%"):
+        try:
+            return float(s[:-1])
+        except ValueError:
+            return None
+    mult = 1.0
+    for suf, m in (("万亿", 1e12), ("亿", 1e8), ("万", 1e4), ("千", 1e3)):
+        if s.endswith(suf):
+            mult = m
+            s = s[: -len(suf)]
+            break
+    try:
+        return float(s) * mult
+    except ValueError:
+        return None
+
+
 def fetch_financials() -> dict:
     """Per-ticker full-history financial abstract — chunked over 7 days.
 
@@ -648,12 +684,36 @@ def fetch_financials() -> dict:
              chunk_idx, len(chunk), len(codes))
 
     def one(code: str):
-        df = _ak_call(ak.stock_financial_abstract, symbol=code)
-        if df is not None and not df.empty:
-            df = df.copy()
-            df["code"] = code
-            return df
-        return None
+        """Per-ticker fetch — uses THS (Sina's IP-banned).
+
+        THS schema is wide (rows=报告期, cols=指标); we transpose into the legacy
+        Sina-compatible long shape (rows=指标, cols=YYYYMMDD) so downstream
+        parquet schema and dedup keys (code, 指标) stay valid.
+        """
+        df = _ak_call(ak.stock_financial_abstract_ths,
+                      symbol=code, indicator="按报告期")
+        if df is None or df.empty or "报告期" not in df.columns:
+            return None
+        # 1) Set index to 报告期, transpose so rows=indicator names, cols=report dates
+        wide = df.set_index("报告期")
+        long = wide.T.reset_index().rename(columns={"index": "指标"})
+        # 2) Coerce date column headers from "YYYY-MM-DD" → "YYYYMMDD" to match Sina
+        rename_map = {}
+        for c in long.columns:
+            if c == "指标":
+                continue
+            cs = str(c)
+            if len(cs) == 10 and cs[4] == "-" and cs[7] == "-":
+                rename_map[c] = cs.replace("-", "")
+        long = long.rename(columns=rename_map)
+        # 3) Parse all date-column values (万/亿/%/False) → float
+        date_cols = [c for c in long.columns if c != "指标" and c.isdigit() and len(c) == 8]
+        for c in date_cols:
+            long[c] = long[c].map(_parse_ths_value)
+        # 4) Add 选项 + code to match Sina schema exactly
+        long.insert(0, "选项", "常用指标")
+        long["code"] = code
+        return long
 
     df_chunk = _per_ticker_serial(
         chunk, one, label=f"financials-c{chunk_idx}",
@@ -689,7 +749,26 @@ def fetch_financials() -> dict:
         full = full.drop_duplicates(subset=dedup_cols, keep="last")
 
     today = _today_cn().isoformat()
-    _write_parquet(full, "financials/latest.parquet")
+    # Trim latest.parquet to 2018+ date columns + zstd compression.
+    # Without this, outer-join of Sina (132 date cols) + THS (124 date cols) →
+    # 163-col 142MB parquet that exceeds GitHub's 100MB pre-receive limit.
+    # 2018+ is sufficient for slate's 1-3 month band trading horizon.
+    # Full history stays in history/chunks/.
+    keep_date_cols = [
+        c for c in full.columns
+        if c.isdigit() and len(c) == 8 and int(c[:4]) >= 2018
+    ]
+    keep_meta_cols = [c for c in ("选项", "指标", "code") if c in full.columns]
+    keep_cols = keep_meta_cols + sorted(keep_date_cols, reverse=True)
+    full_trim = full[keep_cols] if keep_date_cols else full
+    # zstd compression (level 15, ~3x snappy ratio for sparse numeric)
+    latest_path = REPO_ROOT / "data" / "financials" / "latest.parquet"
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    full_trim.to_parquet(
+        latest_path, compression="zstd", compression_level=15, index=False
+    )
+    log.info("  wrote financials/latest.parquet (rows=%d, cols=%d, %dKB) [trimmed >=2018, zstd]",
+             len(full_trim), len(keep_cols), latest_path.stat().st_size // 1024)
     kb = _write_parquet(df_chunk, f"financials/history/{today}-c{chunk_idx}.parquet")
     return {
         "rows": len(full),
@@ -723,12 +802,67 @@ def fetch_macro() -> dict:
 
 
 def fetch_north_flow() -> dict:
-    df = _ak_call(ak.stock_hsgt_hold_stock_em, market="北向", indicator="今日排行")
+    """北向持股快照 (季度披露).
+
+    NOTE: Eastmoney 自 2024-08-16 起停发 daily 北向持股明细,
+    AKShare 的 stock_hsgt_hold_stock_em (RPT_MUTUAL_STOCK_NORTHSTA) 全部返回
+    result=null. 改用季度披露报表 RPT_MUTUAL_HOLDSTOCKNORTH_STA, 每季度更新一次.
+
+    Schema 字段保持向下兼容 (代码/名称/今日收盘价/今日涨跌幅/今日持股-股数/...);
+    没有的字段 (今日增持估计-*/所属板块) 不再写入, 消费端用 .get() 取所以不会炸.
+    """
+    url = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+    params = {
+        "sortColumns": "HOLD_MARKET_CAP",
+        "sortTypes": "-1",
+        "pageSize": "500",
+        "pageNumber": "1",
+        "reportName": "RPT_MUTUAL_HOLDSTOCKNORTH_STA",
+        "columns": "ALL",
+        "source": "WEB",
+        "client": "WEB",
+        # 003 = 北上 (沪股通+深股通); 排除港股通南向
+        "filter": '(MUTUAL_TYPE="003")',
+    }
+    time.sleep(AKSHARE_SLEEP)
+    r = _retry(requests.get, url, params=params, timeout=20,
+               tries=5, base_delay=10.0)
+    j = r.json()
+    if j.get("result") is None:
+        raise RuntimeError(f"north_flow upstream empty: {j.get('message')}")
+    pages = int(j["result"]["pages"])
+    rows = list(j["result"]["data"])
+    for page in range(2, pages + 1):
+        params["pageNumber"] = str(page)
+        time.sleep(AKSHARE_SLEEP)
+        r = _retry(requests.get, url, params=params, timeout=20,
+                   tries=5, base_delay=10.0)
+        rj = r.json()
+        if rj.get("result") and rj["result"].get("data"):
+            rows.extend(rj["result"]["data"])
+    if not rows:
+        raise RuntimeError("north_flow returned 0 rows after pagination")
+    raw = pd.DataFrame(rows)
+    df = pd.DataFrame({
+        "代码": raw["SECURITY_CODE"].astype(str).str.zfill(6),
+        "名称": raw["SECURITY_NAME"],
+        "今日收盘价": pd.to_numeric(raw["CLOSE_PRICE"], errors="coerce"),
+        "今日涨跌幅": pd.to_numeric(raw["CHANGE_RATE"], errors="coerce"),
+        "今日持股-股数": pd.to_numeric(raw["HOLD_SHARES"], errors="coerce"),
+        "今日持股-市值": pd.to_numeric(raw["HOLD_MARKET_CAP"], errors="coerce"),
+        "今日持股-占流通股比": pd.to_numeric(raw["FREE_SHARES_RATIO"], errors="coerce"),
+        "今日持股-占总股本比": pd.to_numeric(raw["TOTAL_SHARES_RATIO"], errors="coerce"),
+        "持股变动-1日": pd.to_numeric(raw["HOLD_MARKETCAP_CHG1"], errors="coerce"),
+        "持股变动-5日": pd.to_numeric(raw["HOLD_MARKETCAP_CHG5"], errors="coerce"),
+        "持股变动-10日": pd.to_numeric(raw["HOLD_MARKETCAP_CHG10"], errors="coerce"),
+        "日期": pd.to_datetime(raw["TRADE_DATE"]).dt.strftime("%Y-%m-%d"),
+    })
     today = _today_cn().isoformat()
     df["as_of"] = today
     _write_parquet(df, "north_flow/latest.parquet")
     kb = _write_parquet(df, f"north_flow/history/{today}.parquet")
-    return {"rows": len(df), "size_kb": kb}
+    trade_date = df["日期"].iloc[0] if len(df) else None
+    return {"rows": len(df), "size_kb": kb, "trade_date": trade_date}
 
 
 def fetch_lhb() -> dict:

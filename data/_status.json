@@ -128,18 +128,19 @@
       "last_success": "2026-05-24T03:09:47.054264+00:00"
     },
     "financials": {
-      "last_attempt": "2026-05-23T20:14:11.239360+00:00",
-      "last_elapsed_s": 2120.0,
+      "last_attempt": "2026-05-24T04:44:40.443152+00:00",
+      "last_elapsed_s": 1721.6,
       "last_meta": {
-        "rows": 162960,
-        "chunk_rows": 62960,
-        "chunk_idx": 3,
-        "size_kb": 26618
+        "rows": 314302,
+        "chunk_rows": 18871,
+        "chunk_idx": 4,
+        "size_kb": 4810
       },
-      "last_error": "RuntimeError: financials chunk 3 returned 0 rows",
-      "fail_streak": 4,
-      "last_success": "2026-04-25T19:56:43.005985+00:00",
-      "last_error_at": "2026-05-23T20:14:11.239404+00:00"
+      "last_error": null,
+      "fail_streak": 0,
+      "last_success": "2026-05-24T04:44:40.443152+00:00",
+      "last_error_at": "2026-05-23T20:14:11.239404+00:00",
+      "last_push_error": "2026-05-24T05:33:11.218311+00:00"
     },
     "concepts": {
       "last_attempt": "2026-05-21T20:19:03.315715+00:00",
@@ -218,11 +219,11 @@
     }
   },
   "last_pass": {
-    "at": "2026-05-24T03:10:40.026760+00:00",
-    "succeeded": 7,
-    "failed": 1,
+    "at": "2026-05-24T04:44:48.038435+00:00",
+    "succeeded": 1,
+    "failed": 0,
     "skipped": 0,
-    "elapsed_s": 86.6
+    "elapsed_s": 1729.2
   },
-  "updated_at": "2026-05-24T03:10:40.026790+00:00"
+  "updated_at": "2026-05-24T05:33:11.222191+00:00"
 }
