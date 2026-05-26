@@ -113,20 +113,20 @@
       "last_attempt": "2026-05-19T20:52:37.759238+00:00"
     },
     "filings": {
-      "last_attempt": "2026-05-25T22:28:29.288574+00:00",
-      "last_elapsed_s": 20.1,
+      "last_attempt": "2026-05-26T03:08:57.357364+00:00",
+      "last_elapsed_s": 12.4,
       "last_meta": {
-        "rows": 42322,
-        "size_kb": 1931,
+        "rows": 43542,
+        "size_kb": 1989,
         "window_days": 30,
         "dup_dropped": 0,
-        "days_ok": 1,
-        "days_err": 1,
+        "days_ok": 2,
+        "days_err": 0,
         "days_skip_cached": 22
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_success": "2026-05-25T22:28:29.288574+00:00"
+      "last_success": "2026-05-26T03:08:57.357364+00:00"
     },
     "financials": {
       "last_attempt": "2026-05-25T20:11:19.721629+00:00",
@@ -226,5 +226,5 @@
     "skipped": 0,
     "elapsed_s": 115.7
   },
-  "updated_at": "2026-05-26T03:08:44.911813+00:00"
+  "updated_at": "2026-05-26T03:08:57.357774+00:00"
 }
