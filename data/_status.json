@@ -101,8 +101,8 @@
       "last_attempt": "2026-05-26T15:18:48.260525+00:00"
     },
     "research": {
-      "last_success": "2026-05-26T20:03:18.682601+00:00",
-      "last_elapsed_s": 2542.4,
+      "last_success": "2026-05-26T20:49:20.699399+00:00",
+      "last_elapsed_s": 2541.1,
       "last_meta": {
         "rows": 25671,
         "aggregate_rows": 98,
@@ -112,7 +112,7 @@
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-05-26T20:03:18.682601+00:00"
+      "last_attempt": "2026-05-26T20:49:20.699399+00:00"
     },
     "filings": {
       "last_attempt": "2026-05-26T15:17:40.154219+00:00",
@@ -228,5 +228,5 @@
     "skipped": 0,
     "elapsed_s": 2543.7
   },
-  "updated_at": "2026-05-26T20:03:19.940819+00:00"
+  "updated_at": "2026-05-26T20:49:20.701142+00:00"
 }
