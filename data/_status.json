@@ -13,20 +13,18 @@
       "last_attempt": "2026-05-27T07:33:37.236822+00:00"
     },
     "market_daily": {
-      "last_success": "2026-05-27T09:57:35.795572+00:00",
-      "last_elapsed_s": 311.3,
+      "last_success": "2026-05-27T10:53:23.850409+00:00",
+      "last_elapsed_s": 236.2,
       "last_meta": {
-        "rows": 5266,
-        "filled_dates": [
-          "2026-05-27"
-        ],
-        "pending_total": 4,
+        "rows": 0,
+        "filled_dates": [],
+        "pending_total": 3,
         "budget": 20,
-        "no_work": false
+        "no_work": true
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-05-27T09:57:35.795572+00:00"
+      "last_attempt": "2026-05-27T10:53:23.850409+00:00"
     },
     "macro": {
       "last_success": "2026-05-27T07:33:49.275739+00:00",
@@ -224,5 +222,5 @@
     "skipped": 0,
     "elapsed_s": 311.6
   },
-  "updated_at": "2026-05-27T09:57:36.049907+00:00"
+  "updated_at": "2026-05-27T10:53:23.850694+00:00"
 }
