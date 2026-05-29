@@ -38,13 +38,13 @@
     },
     "news": {
       "last_success": "2026-05-28T15:31:58.076299+00:00",
-      "last_elapsed_s": 513.3,
+      "last_elapsed_s": 512.8,
       "last_meta": {
         "rows": 0
       },
       "last_error": null,
-      "fail_streak": 3,
-      "last_attempt": "2026-05-29T07:35:45.815231+00:00"
+      "fail_streak": 4,
+      "last_attempt": "2026-05-29T11:15:42.364630+00:00"
     },
     "north_flow": {
       "last_success": "2026-05-29T07:35:54.309439+00:00",
@@ -222,5 +222,5 @@
     "skipped": 0,
     "elapsed_s": 240.7
   },
-  "updated_at": "2026-05-29T11:07:09.503407+00:00"
+  "updated_at": "2026-05-29T11:15:42.365879+00:00"
 }
