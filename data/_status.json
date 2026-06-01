@@ -1,8 +1,8 @@
 {
   "endpoints": {
     "securities": {
-      "last_success": "2026-06-01T03:09:58.728954+00:00",
-      "last_elapsed_s": 8.4,
+      "last_success": "2026-06-01T07:53:16.979308+00:00",
+      "last_elapsed_s": 8.8,
       "last_meta": {
         "rows": 5525,
         "size_kb": 91,
@@ -10,7 +10,7 @@
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-06-01T03:09:58.728954+00:00"
+      "last_attempt": "2026-06-01T07:53:16.979308+00:00"
     },
     "market_daily": {
       "last_success": "2026-05-31T10:20:50.271927+00:00",
@@ -226,5 +226,5 @@
     "skipped": 0,
     "elapsed_s": 595.2
   },
-  "updated_at": "2026-06-01T03:19:45.479558+00:00"
+  "updated_at": "2026-06-01T07:53:16.979612+00:00"
 }
