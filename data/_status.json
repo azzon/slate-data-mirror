@@ -87,14 +87,14 @@
       "last_attempt": "2026-06-15T12:13:39.161276+00:00"
     },
     "margin": {
-      "last_success": "2026-06-15T08:16:31.113888+00:00",
-      "last_elapsed_s": 20.6,
+      "last_success": "2026-06-15T12:14:00.533345+00:00",
+      "last_elapsed_s": 20.7,
       "last_meta": {
         "rows": 26
       },
       "last_error": null,
       "fail_streak": 0,
-      "last_attempt": "2026-06-15T08:16:31.113888+00:00"
+      "last_attempt": "2026-06-15T12:14:00.533345+00:00"
     },
     "research": {
       "last_success": "2026-06-09T20:40:15.635462+00:00",
@@ -224,5 +224,5 @@
     "skipped": 0,
     "elapsed_s": 1.2
   },
-  "updated_at": "2026-06-15T12:13:39.161587+00:00"
+  "updated_at": "2026-06-15T12:14:00.533853+00:00"
 }
